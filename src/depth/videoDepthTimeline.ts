@@ -1,6 +1,6 @@
 import {
   extractLeftEyeRgba,
-  extractRightEyeRgba,
+  extractRectifiedRightEyeRgba,
   calibrateDepthWithStereoSBS,
 } from './stereoGuidedDepth.js';
 import type {
@@ -20,22 +20,20 @@ export interface TimelineProgress {
   completedFrames: number;
   totalFrames: number;
   v3Frames: number;
-  v2Frames: number;
   isComplete: boolean;
 }
 
 export interface VideoDepthTimelineOptions {
   fps?: number; // default 20 (matching 3DS .AVI 20fps)
-  inputSize?: number; // default 336 (multiple of 14: 24 * 14, 2.3x faster than 504 while > 240p)
+  inputSize?: number; // default 392 (28*14 x 14*14 exact 2:1 rectangular)
+  workerPoolSize?: number; // default 2
   baseDisp?: number;
   maxDisp?: number;
   expandRadius?: number;
   workerUrl?: string | URL;
   workerV3?: Worker;
-  workerV2?: Worker;
   wasmPaths?: Record<string, string> | string;
   modelPathV3?: string;
-  modelPathV2?: string;
   initialKeyframes?: number; // default 12
   runFullStreamInBackground?: boolean; // default true
   frameExtractor?: (timeSec: number, frameIndex: number) => Promise<Uint8Array | null>;
@@ -45,7 +43,7 @@ export interface VideoDepthTimelineOptions {
     height: number,
     size: number,
     rightRgba?: Uint8Array,
-    modelVersion?: 'v3' | 'v2'
+    modelVersion?: 'v3' | string
   ) => Promise<{
     rawDepth: Float32Array;
     rawRightDepth?: Float32Array;
@@ -156,8 +154,7 @@ class WorkerClient {
 
 /**
  * Pre-computes and caches frame-accurate consensus depth timelines across entire video streams.
- * Eliminates depth/video desync by ensuring both V3 (Left+Right) and V2 (Left+Right)
- * depth maps are available for any video.currentTime timestamp.
+ * Utilizes a parallel pool of DepthAnythingV3 workers and edge-guided temporal interpolation.
  */
 export class VideoDepthTimeline {
   public readonly fps: number;
@@ -170,14 +167,13 @@ export class VideoDepthTimeline {
   private duration: number = 0;
   private totalFrames: number = 0;
   private timelineV3 = new Map<number, Uint8Array>();
-  private timelineV2 = new Map<number, Uint8Array>();
+  private lumaMap = new Map<number, Uint8Array>();
 
   private scratchBuffer: Uint8Array | null = null;
   private scratchWidth: number = 480;
   private scratchHeight: number = 240;
 
-  private clientV3: WorkerClient | null = null;
-  private clientV2: WorkerClient | null = null;
+  private workersV3: WorkerClient[] = [];
 
   private offscreenVideo: HTMLVideoElement | null = null;
   private canvas: HTMLCanvasElement | OffscreenCanvas | null = null;
@@ -192,7 +188,7 @@ export class VideoDepthTimeline {
   constructor(options?: VideoDepthTimelineOptions) {
     this.options = { ...options };
     this.fps = options?.fps ?? 20;
-    this.inputSize = options?.inputSize ?? 336; // 24 * 14 = 336: 2.3x faster than 504 while exceeding 3DS 240p
+    this.inputSize = options?.inputSize ?? 392; // 28 * 14 = 392, exact 2:1 rectangular resolution
     this.baseDisp = options?.baseDisp ?? 0;
     this.maxDisp = options?.maxDisp ?? 16;
     this.expandRadius = options?.expandRadius ?? 1;
@@ -217,26 +213,30 @@ export class VideoDepthTimeline {
   }
 
   public isReady(): boolean {
-    return this.timelineV3.size > 0 || this.timelineV2.size > 0;
+    return this.timelineV3.size > 0;
   }
 
-  public hasFrame(frameIdx: number, modelVersion: 'v3' | 'v2'): boolean {
-    const map = modelVersion === 'v3' ? this.timelineV3 : this.timelineV2;
-    return map.has(frameIdx);
+  public hasFrame(frameIdx: number, _modelVersion?: 'v3' | string): boolean {
+    return this.timelineV3.has(frameIdx);
   }
 
-  public setFrameDepth(frameIdx: number, modelVersion: 'v3' | 'v2', depth: Uint8Array): void {
-    const map = modelVersion === 'v3' ? this.timelineV3 : this.timelineV2;
-    map.set(frameIdx, depth);
-    if (!this.scratchBuffer) {
-      this.scratchBuffer = new Uint8Array(depth.length);
+  public setFrameDepth(
+    frameIdx: number,
+    modelVersionOrDepth: 'v3' | string | Uint8Array,
+    depthArg?: Uint8Array
+  ): void {
+    const depth = depthArg ?? (modelVersionOrDepth instanceof Uint8Array ? modelVersionOrDepth : undefined);
+    if (depth) {
+      this.timelineV3.set(frameIdx, depth);
+      if (!this.scratchBuffer) {
+        this.scratchBuffer = new Uint8Array(depth.length);
+      }
     }
   }
 
-  public getFrameCount(): { v3: number; v2: number; total: number } {
+  public getFrameCount(): { v3: number; total: number } {
     return {
       v3: this.timelineV3.size,
-      v2: this.timelineV2.size,
       total: this.totalFrames,
     };
   }
@@ -247,14 +247,12 @@ export class VideoDepthTimeline {
 
   public getProgress(): TimelineProgress {
     const v3Frames = this.timelineV3.size;
-    const v2Frames = this.timelineV2.size;
-    const completedFrames = Math.min(v3Frames, v2Frames);
+    const completedFrames = v3Frames;
     const isComplete = this.isComplete || (this.totalFrames > 0 && completedFrames >= this.totalFrames);
     return {
       completedFrames,
       totalFrames: this.totalFrames,
       v3Frames,
-      v2Frames,
       isComplete,
     };
   }
@@ -265,10 +263,13 @@ export class VideoDepthTimeline {
   }
 
   /**
-   * Initializes dedicated ONNX Web Workers for V3 and V2 if customInfer is not provided.
+   * Initializes a parallel pool of dedicated ONNX Web Workers for DepthAnythingV3.
    */
   private async initWorkers(): Promise<void> {
     if (this.options.customInfer || typeof Worker === 'undefined') {
+      return;
+    }
+    if (this.workersV3.length > 0) {
       return;
     }
 
@@ -280,46 +281,26 @@ export class VideoDepthTimeline {
     const defaultModelV3 = typeof window !== 'undefined'
       ? new URL('./models/depthanythingv3.onnx', window.location.href).href
       : '/models/depthanythingv3.onnx';
-    const defaultModelV2 = typeof window !== 'undefined'
-      ? new URL('./models/depthanythingv2.onnx', window.location.href).href
-      : '/models/depthanythingv2.onnx';
 
-    if (!this.clientV3) {
-      let workerV3: Worker;
-      if (this.options.workerV3) {
-        workerV3 = this.options.workerV3;
-      } else if (this.options.workerUrl) {
-        workerV3 = new Worker(this.options.workerUrl, { type: 'module' });
+    const poolSize = this.options.workerPoolSize ?? 2;
+    const workerUrl = this.options.workerUrl || new URL('./depthAnythingWorker.ts', import.meta.url);
+
+    for (let i = 0; i < poolSize; i++) {
+      let worker: Worker;
+      if (i === 0 && this.options.workerV3) {
+        worker = this.options.workerV3;
       } else {
-        workerV3 = new Worker(new URL('./depthAnythingWorker.ts', import.meta.url), { type: 'module' });
+        worker = new Worker(workerUrl, { type: 'module' });
       }
-      this.clientV3 = new WorkerClient(workerV3);
-      await this.clientV3.init({
+      const client = new WorkerClient(worker);
+      await client.init({
         type: 'init',
         wasmPaths,
         modelPath: this.options.modelPathV3 || defaultModelV3,
         modelVersion: 'v3',
         preferWebGPU: true,
       });
-    }
-
-    if (!this.clientV2) {
-      let workerV2: Worker;
-      if (this.options.workerV2) {
-        workerV2 = this.options.workerV2;
-      } else if (this.options.workerUrl) {
-        workerV2 = new Worker(this.options.workerUrl, { type: 'module' });
-      } else {
-        workerV2 = new Worker(new URL('./depthAnythingWorker.ts', import.meta.url), { type: 'module' });
-      }
-      this.clientV2 = new WorkerClient(workerV2);
-      await this.clientV2.init({
-        type: 'init',
-        wasmPaths,
-        modelPath: this.options.modelPathV2 || defaultModelV2,
-        modelVersion: 'v2',
-        preferWebGPU: true,
-      });
+      this.workersV3.push(client);
     }
   }
 
@@ -436,19 +417,27 @@ export class VideoDepthTimeline {
   }
 
   /**
-   * Computes consensus depth for a single model on an SBS frame (both Left and Right eyes).
+   * Computes consensus depth for DepthAnythingV3 on an SBS frame (both Left and pre-rectified Right eyes).
    */
   public async computeConsensusDepthForFrame(
     sbsRgba: Uint8Array,
     sbsWidth: number,
     sbsHeight: number,
     frameIndex: number,
-    modelVersion: 'v3' | 'v2'
+    workerIndex: number = 0
   ): Promise<Uint8Array> {
     const eyeW = Math.floor(sbsWidth / 2);
     const eyeH = sbsHeight;
     const leftRgba = extractLeftEyeRgba(sbsRgba, sbsWidth, sbsHeight);
-    const rightRgba = extractRightEyeRgba(sbsRgba, sbsWidth, sbsHeight);
+    const rightRgba = extractRectifiedRightEyeRgba(sbsRgba, sbsWidth, sbsHeight, this.baseDisp);
+
+    // Save compact Left Eye luma for edge-guided temporal interpolation
+    const leftLuma = new Uint8Array(eyeW * eyeH);
+    for (let i = 0; i < eyeW * eyeH; i++) {
+      const idx = i * 4;
+      leftLuma[i] = Math.round(0.299 * leftRgba[idx] + 0.587 * leftRgba[idx + 1] + 0.114 * leftRgba[idx + 2]);
+    }
+    this.lumaMap.set(frameIndex, leftLuma);
 
     let rawDepth: Float32Array;
     let rawRightDepth: Float32Array | undefined;
@@ -462,17 +451,17 @@ export class VideoDepthTimeline {
         eyeH,
         this.inputSize,
         rightRgba,
-        modelVersion
+        'v3'
       );
       rawDepth = res.rawDepth;
       rawRightDepth = res.rawRightDepth;
       conf0 = res.conf0;
       conf1 = res.conf1;
     } else {
-      const client = modelVersion === 'v3' ? this.clientV3 : this.clientV2;
-      if (!client) {
-        throw new Error(`Worker client for ${modelVersion} not initialized`);
+      if (this.workersV3.length === 0) {
+        throw new Error('V3 worker clients not initialized');
       }
+      const client = this.workersV3[workerIndex % this.workersV3.length];
       const res = await client.infer(
         frameIndex,
         leftRgba,
@@ -500,6 +489,7 @@ export class VideoDepthTimeline {
         rightDaDepth: rawRightDepth,
         conf0,
         conf1,
+        rightIsRectified: this.baseDisp !== 0,
       }
     );
 
@@ -514,8 +504,8 @@ export class VideoDepthTimeline {
 
   /**
    * Phase 1 (Initial Pre-Pass):
-   * Extracts evenly spaced keyframes across 0..duration for BOTH V3 and V2 before playback starts,
-   * reporting progress via onProgress('Analyzing 3D depth (V3 & V2)...', ratio).
+   * Extracts evenly spaced keyframes across 0..duration for DepthAnythingV3 before playback starts,
+   * processing batches of 2 in parallel across workers.
    *
    * Phase 2 (Continuous Full-Stream Background Fill):
    * Asynchronously fills every remaining 20fps frame index 0..totalFrames-1 in background.
@@ -555,30 +545,33 @@ export class VideoDepthTimeline {
     }
     const keyframeIndices = Array.from(keyframesSet).sort((a, b) => a - b);
 
-    // Phase 1: Pre-compute initial keyframes for BOTH V3 and V2
-    onProgress?.('Analyzing 3D depth (V3 & V2)...', 0.0);
+    // Phase 1: Pre-compute initial keyframes using parallel batches of 2
+    onProgress?.('Analyzing 3D depth (DepthAnythingV3)...', 0.0);
 
-    for (let i = 0; i < keyframeIndices.length; i++) {
+    for (let i = 0; i < keyframeIndices.length; i += 2) {
       if (this.isDestroyed) return;
-      const frameIdx = keyframeIndices[i];
-      const timeSec = Math.max(0, Math.min(this.duration, frameIdx / this.fps));
+      const batch = keyframeIndices.slice(i, i + 2);
+      const tasks = batch.map(async (frameIdx, idxInBatch) => {
+        const timeSec = Math.max(0, Math.min(this.duration, frameIdx / this.fps));
+        const sbsRgba = await this.extractFrameRgba(video, timeSec, frameIdx);
+        if (sbsRgba) {
+          const depth = await this.computeConsensusDepthForFrame(
+            sbsRgba,
+            sbsW,
+            sbsH,
+            frameIdx,
+            idxInBatch
+          );
+          this.timelineV3.set(frameIdx, depth);
+        }
+      });
+      await Promise.all(tasks);
 
-      const sbsRgba = await this.extractFrameRgba(video, timeSec, frameIdx);
-      if (sbsRgba) {
-        // Run V3
-        const depthV3 = await this.computeConsensusDepthForFrame(sbsRgba, sbsW, sbsH, frameIdx, 'v3');
-        this.timelineV3.set(frameIdx, depthV3);
-
-        // Run V2
-        const depthV2 = await this.computeConsensusDepthForFrame(sbsRgba, sbsW, sbsH, frameIdx, 'v2');
-        this.timelineV2.set(frameIdx, depthV2);
-      }
-
-      const ratio = (i + 1) / keyframeIndices.length;
-      onProgress?.('Analyzing 3D depth (V3 & V2)...', Math.min(1.0, ratio));
+      const ratio = Math.min(1.0, (i + batch.length) / keyframeIndices.length);
+      onProgress?.('Analyzing 3D depth (DepthAnythingV3)...', ratio);
     }
 
-    if (this.timelineV3.size >= this.totalFrames && this.timelineV2.size >= this.totalFrames) {
+    if (this.timelineV3.size >= this.totalFrames) {
       this.isComplete = true;
       this.allFramesResolve?.();
       return;
@@ -588,14 +581,13 @@ export class VideoDepthTimeline {
     if (runFullStream) {
       this.startBackgroundFill(video, sbsW, sbsH, onProgress);
     } else {
-      // Synchronous full-stream completion
       await this.fillAllRemainingFrames(video, sbsW, sbsH, onProgress);
     }
   }
 
   /**
    * Pre-computes all frames across the entire video stream from t = 0 to t = duration,
-   * blocking until 100% of all frames for both V3 and V2 are finished.
+   * blocking until 100% of all frames for DepthAnythingV3 are finished.
    */
   public async precomputeFullVideo(
     video: HTMLVideoElement,
@@ -632,34 +624,36 @@ export class VideoDepthTimeline {
     sbsH: number,
     onProgress?: (stage: string, ratio: number) => void
   ): Promise<void> {
+    const missingFrames: number[] = [];
     for (let frameIdx = 0; frameIdx < this.totalFrames; frameIdx++) {
+      if (!this.timelineV3.has(frameIdx)) {
+        missingFrames.push(frameIdx);
+      }
+    }
+
+    for (let i = 0; i < missingFrames.length; i += 2) {
       if (this.isDestroyed) return;
-
-      const needsV3 = !this.timelineV3.has(frameIdx);
-      const needsV2 = !this.timelineV2.has(frameIdx);
-
-      if (!needsV3 && !needsV2) {
-        continue;
-      }
-
-      const timeSec = Math.max(0, Math.min(this.duration, frameIdx / this.fps));
-      const sbsRgba = await this.extractFrameRgba(video, timeSec, frameIdx);
-
-      if (sbsRgba) {
-        if (needsV3) {
-          const depthV3 = await this.computeConsensusDepthForFrame(sbsRgba, sbsW, sbsH, frameIdx, 'v3');
-          this.timelineV3.set(frameIdx, depthV3);
+      const batch = missingFrames.slice(i, i + 2);
+      const tasks = batch.map(async (frameIdx, idxInBatch) => {
+        const timeSec = Math.max(0, Math.min(this.duration, frameIdx / this.fps));
+        const sbsRgba = await this.extractFrameRgba(video, timeSec, frameIdx);
+        if (sbsRgba) {
+          const depth = await this.computeConsensusDepthForFrame(
+            sbsRgba,
+            sbsW,
+            sbsH,
+            frameIdx,
+            idxInBatch
+          );
+          this.timelineV3.set(frameIdx, depth);
         }
-        if (needsV2) {
-          const depthV2 = await this.computeConsensusDepthForFrame(sbsRgba, sbsW, sbsH, frameIdx, 'v2');
-          this.timelineV2.set(frameIdx, depthV2);
-        }
-      }
+      });
+      await Promise.all(tasks);
 
       const prog = this.getProgress();
       if (onProgress) {
         const ratio = prog.completedFrames / Math.max(1, prog.totalFrames);
-        onProgress('Computing full-stream depth (V3 & V2)...', ratio);
+        onProgress('Computing full-stream depth (DepthAnythingV3)...', ratio);
       }
 
       // Small yield between background frames to keep browser render loop at 60 FPS
@@ -673,24 +667,23 @@ export class VideoDepthTimeline {
   /**
    * Fast, frame-accurate depth lookup for any video timestamp.
    * - If exact frame index is cached: returns O(1) in 0.0ms.
-   * - If exact frame is still being processed: temporally interpolates between bounding keyframes
-   *   kPrev and kNext in <0.3ms with ZERO phase lag or desync!
+   * - If exact frame is still being processed: edge-guided temporal interpolation between bounding keyframes
+   *   in <0.3ms with ZERO ghosting or phase lag!
    */
-  public getDepthAtTime(timeSec: number, modelVersion: 'v3' | 'v2'): Uint8Array | null {
+  public getDepthAtTime(timeSec: number, modelVersion?: 'v3' | string): Uint8Array | null {
     const res = this.getDepthForTime(timeSec, modelVersion);
     return res ? res.depth : null;
   }
 
   /**
    * Detailed depth lookup returning frame index and whether the depth map is an exact neural pass
-   * or a temporally interpolated bounding frame.
+   * or an edge-guided temporally interpolated bounding frame.
    */
   public getDepthForTime(
     currentTimeSec: number,
-    modelVersion: 'v3' | 'v2'
+    _modelVersion?: 'v3' | string
   ): TimelineDepthResult | null {
-    const timeline = modelVersion === 'v3' ? this.timelineV3 : this.timelineV2;
-    if (timeline.size === 0) {
+    if (this.timelineV3.size === 0) {
       return null;
     }
 
@@ -698,9 +691,9 @@ export class VideoDepthTimeline {
     const exactFrameIdx = Math.min(this.totalFrames - 1, Math.max(0, Math.round(clampedTime * this.fps)));
 
     // 1. Exact frame match
-    if (timeline.has(exactFrameIdx)) {
+    if (this.timelineV3.has(exactFrameIdx)) {
       return {
-        depth: timeline.get(exactFrameIdx)!,
+        depth: this.timelineV3.get(exactFrameIdx)!,
         frameIndex: exactFrameIdx,
         isExact: true,
       };
@@ -711,31 +704,50 @@ export class VideoDepthTimeline {
     let nextIdx = -1;
 
     for (let f = exactFrameIdx - 1; f >= 0; f--) {
-      if (timeline.has(f)) {
+      if (this.timelineV3.has(f)) {
         prevIdx = f;
         break;
       }
     }
     for (let f = exactFrameIdx + 1; f < this.totalFrames; f++) {
-      if (timeline.has(f)) {
+      if (this.timelineV3.has(f)) {
         nextIdx = f;
         break;
       }
     }
 
     if (prevIdx !== -1 && nextIdx !== -1) {
-      const prev = timeline.get(prevIdx)!;
-      const next = timeline.get(nextIdx)!;
+      const prev = this.timelineV3.get(prevIdx)!;
+      const next = this.timelineV3.get(nextIdx)!;
       const alpha = (exactFrameIdx - prevIdx) / (nextIdx - prevIdx);
 
       if (!this.scratchBuffer || this.scratchBuffer.length !== prev.length) {
         this.scratchBuffer = new Uint8Array(prev.length);
       }
 
-      // Linear temporal interpolation
+      const prevLuma = this.lumaMap.get(prevIdx);
+      const nextLuma = this.lumaMap.get(nextIdx);
       const len = prev.length;
-      for (let i = 0; i < len; i++) {
-        this.scratchBuffer[i] = Math.round((1 - alpha) * prev[i] + alpha * next[i]);
+
+      if (prevLuma && nextLuma) {
+        // Edge-guided temporal interpolation: smoothstep weighting at sharp edges to prevent ghosting
+        for (let i = 0; i < len; i++) {
+          const lumaDiff = Math.abs(prevLuma[i] - nextLuma[i]);
+          const depthDiff = Math.abs(prev[i] - next[i]);
+
+          let effectiveAlpha = alpha;
+          if (depthDiff > 20 || lumaDiff > 25) {
+            effectiveAlpha = alpha < 0.5
+              ? 2 * alpha * alpha
+              : 1 - 2 * (1 - alpha) * (1 - alpha);
+          }
+          this.scratchBuffer[i] = Math.round((1 - effectiveAlpha) * prev[i] + effectiveAlpha * next[i]);
+        }
+      } else {
+        // Linear temporal interpolation
+        for (let i = 0; i < len; i++) {
+          this.scratchBuffer[i] = Math.round((1 - alpha) * prev[i] + alpha * next[i]);
+        }
       }
 
       return {
@@ -747,7 +759,7 @@ export class VideoDepthTimeline {
 
     if (prevIdx !== -1) {
       return {
-        depth: timeline.get(prevIdx)!,
+        depth: this.timelineV3.get(prevIdx)!,
         frameIndex: prevIdx,
         isExact: false,
       };
@@ -755,17 +767,17 @@ export class VideoDepthTimeline {
 
     if (nextIdx !== -1) {
       return {
-        depth: timeline.get(nextIdx)!,
+        depth: this.timelineV3.get(nextIdx)!,
         frameIndex: nextIdx,
         isExact: false,
       };
     }
 
     // Fallback: return any available frame
-    const firstKey = timeline.keys().next().value;
+    const firstKey = this.timelineV3.keys().next().value;
     if (firstKey !== undefined) {
       return {
-        depth: timeline.get(firstKey)!,
+        depth: this.timelineV3.get(firstKey)!,
         frameIndex: firstKey,
         isExact: false,
       };
@@ -776,16 +788,12 @@ export class VideoDepthTimeline {
 
   public destroy(): void {
     this.isDestroyed = true;
-    if (this.clientV3) {
-      this.clientV3.destroy();
-      this.clientV3 = null;
+    for (const w of this.workersV3) {
+      w.destroy();
     }
-    if (this.clientV2) {
-      this.clientV2.destroy();
-      this.clientV2 = null;
-    }
+    this.workersV3 = [];
     this.timelineV3.clear();
-    this.timelineV2.clear();
+    this.lumaMap.clear();
     this.scratchBuffer = null;
     if (this.offscreenVideo) {
       this.offscreenVideo.src = '';

@@ -14,6 +14,11 @@ export interface CalibrateDepthOptions {
   rightDaDepth?: Float32Array;
   conf0?: Float32Array;
   conf1?: Float32Array;
+  rightIsRectified?: boolean;
+  asymmetricSearch?: boolean;
+  useGuidedFilter?: boolean;
+  guidedFilterRadius?: number;
+  guidedFilterEps?: number;
 }
 
 export interface CalibrateDepthResult {
@@ -36,7 +41,8 @@ export interface DepthTelemetry {
   fps: number;
   frameId: number;
   anchorCount?: number;
-  modelVersion?: 'v3' | 'v2';
+  modelVersion?: 'v3';
+  v3BaselinePx?: number;
   numViews?: number;
 }
 
@@ -53,8 +59,8 @@ export interface DepthAnythingControllerOptions {
   wasmPaths?: Record<string, string> | string;
   modelPath?: string;
   modelPathWebGPU?: string;
-  modelVersion?: 'v3' | 'v2';
-  inputSize?: number; // default 504 (multiple of 14: 36 * 14)
+  modelVersion?: 'v3' | string;
+  inputSize?: number; // default 392 (28*14 x 14*14 exact 2:1 rectangular)
   baseDisp?: number;
   maxDisp?: number;
   expandRadius?: number;
@@ -62,6 +68,10 @@ export interface DepthAnythingControllerOptions {
   gradThreshold?: number;
   step?: number;
   contrastStretch?: boolean;
+  asymmetricSearch?: boolean;
+  useGuidedFilter?: boolean;
+  guidedFilterRadius?: number;
+  guidedFilterEps?: number;
   timeline?: VideoDepthTimeline;
   onDepthMapReady?: DepthMapReadyCallback;
   customInfer?: (
@@ -70,7 +80,15 @@ export interface DepthAnythingControllerOptions {
     height: number,
     size: number,
     rightRgba?: Uint8Array
-  ) => Promise<{ rawDepth: Float32Array; backend: 'webgpu' | 'wasm'; inferenceTimeMs: number }>;
+  ) => Promise<{
+    rawDepth: Float32Array;
+    rawRightDepth?: Float32Array;
+    conf0?: Float32Array;
+    conf1?: Float32Array;
+    v3BaselinePx?: number;
+    backend: 'webgpu' | 'wasm';
+    inferenceTimeMs: number;
+  }>;
 }
 
 /**
@@ -116,6 +134,154 @@ export function extractRightEyeRgba(
 
   return rightRgba;
 }
+
+/**
+ * Extracts Right Eye RGBA buffer from an SBS RGBA frame pre-rectified (shifted)
+ * horizontally by baseDisp so that pixels at the convergence plane align with Left Eye coordinates.
+ */
+export function extractRectifiedRightEyeRgba(
+  sbsRgba: Uint8Array,
+  sbsWidth: number,
+  sbsHeight: number,
+  baseDisp: number
+): Uint8Array {
+  const eyeWidth = Math.floor(sbsWidth / 2);
+  const rectifiedRight = new Uint8Array(eyeWidth * sbsHeight * 4);
+
+  for (let y = 0; y < sbsHeight; y++) {
+    const sbsRowStart = (y * sbsWidth + eyeWidth) * 4;
+    const eyeRowStart = y * eyeWidth * 4;
+
+    for (let x = 0; x < eyeWidth; x++) {
+      // In Left eye x, matching point in Right eye is shifted by baseDisp: xr = x - baseDisp
+      const srcXr = Math.max(0, Math.min(eyeWidth - 1, Math.round(x - baseDisp)));
+      const sbsIdx = sbsRowStart + srcXr * 4;
+      const dstIdx = eyeRowStart + x * 4;
+
+      rectifiedRight[dstIdx] = sbsRgba[sbsIdx];
+      rectifiedRight[dstIdx + 1] = sbsRgba[sbsIdx + 1];
+      rectifiedRight[dstIdx + 2] = sbsRgba[sbsIdx + 2];
+      rectifiedRight[dstIdx + 3] = sbsRgba[sbsIdx + 3];
+    }
+  }
+
+  return rectifiedRight;
+}
+
+/**
+ * Separable running-sum O(1) box filter.
+ */
+function boxFilter(src: Float32Array, width: number, height: number, radius: number): Float32Array {
+  const out = new Float32Array(width * height);
+  const temp = new Float32Array(width * height);
+  const invWindowX = 1.0 / (2 * radius + 1);
+
+  // Horizontal running sum
+  for (let y = 0; y < height; y++) {
+    const rowOffset = y * width;
+    let sum = 0;
+    const initialEnd = Math.min(width - 1, radius);
+    for (let x = 0; x <= initialEnd; x++) {
+      sum += src[rowOffset + x];
+    }
+    temp[rowOffset] = sum / (initialEnd + 1);
+
+    for (let x = 1; x < width; x++) {
+      if (x + radius < width) {
+        sum += src[rowOffset + x + radius];
+      }
+      if (x - radius - 1 >= 0) {
+        sum -= src[rowOffset + x - radius - 1];
+      }
+      if (x >= radius && x + radius < width) {
+        temp[rowOffset + x] = sum * invWindowX;
+      } else {
+        const count = Math.min(width - 1, x + radius) - Math.max(0, x - radius) + 1;
+        temp[rowOffset + x] = sum / count;
+      }
+    }
+  }
+
+  // Vertical running sum
+  const invWindowY = 1.0 / (2 * radius + 1);
+  for (let x = 0; x < width; x++) {
+    let sum = 0;
+    const initialEnd = Math.min(height - 1, radius);
+    for (let y = 0; y <= initialEnd; y++) {
+      sum += temp[y * width + x];
+    }
+    out[x] = sum / (initialEnd + 1);
+
+    for (let y = 1; y < height; y++) {
+      if (y + radius < height) {
+        sum += temp[(y + radius) * width + x];
+      }
+      if (y - radius - 1 >= 0) {
+        sum -= temp[(y - radius - 1) * width + x];
+      }
+      if (y >= radius && y + radius < height) {
+        out[y * width + x] = sum * invWindowY;
+      } else {
+        const count = Math.min(height - 1, y + radius) - Math.max(0, y - radius) + 1;
+        out[y * width + x] = sum / count;
+      }
+    }
+  }
+
+  return out;
+}
+
+/**
+ * Fast O(N) Edge-Preserving Guided Filter.
+ * Transmits sharp RGB object edges from guideLum directly onto depth map
+ * while eliminating ViT-14 patch blockiness.
+ */
+export function guidedFilterDepth(
+  depth: Float32Array,
+  guideLum: Float32Array,
+  width: number,
+  height: number,
+  radius: number = 4,
+  eps: number = 1e-3
+): Float32Array {
+  const n = width * height;
+  const I = guideLum;
+  const p = depth;
+
+  const meanI = boxFilter(I, width, height, radius);
+  const meanP = boxFilter(p, width, height, radius);
+
+  const Ip = new Float32Array(n);
+  const II = new Float32Array(n);
+  for (let i = 0; i < n; i++) {
+    Ip[i] = I[i] * p[i];
+    II[i] = I[i] * I[i];
+  }
+
+  const meanIp = boxFilter(Ip, width, height, radius);
+  const meanII = boxFilter(II, width, height, radius);
+
+  const a = new Float32Array(n);
+  const b = new Float32Array(n);
+  for (let i = 0; i < n; i++) {
+    const varI = Math.max(0, meanII[i] - meanI[i] * meanI[i]);
+    const covIp = meanIp[i] - meanI[i] * meanP[i];
+    const aVal = covIp / (varI + eps);
+    a[i] = aVal;
+    b[i] = meanP[i] - aVal * meanI[i];
+  }
+
+  const meanA = boxFilter(a, width, height, radius);
+  const meanB = boxFilter(b, width, height, radius);
+
+  const q = new Float32Array(n);
+  for (let i = 0; i < n; i++) {
+    q[i] = meanA[i] * I[i] + meanB[i];
+  }
+
+  return q;
+}
+
 
 /**
  * Bilinearly resamples a 1-channel Float32Array depth map.
@@ -283,6 +449,11 @@ export function calibrateDepthWithStereoSBS(
   let rightDaDepth: Float32Array | undefined;
   let conf0: Float32Array | undefined;
   let conf1: Float32Array | undefined;
+  let rightIsRectified = false;
+  let asymmetricSearch: boolean | undefined;
+  let useGuidedFilter = false;
+  let guidedFilterRadius = 4;
+  let guidedFilterEps = 1e-3;
 
   if (typeof baseDispOrOptions === 'object') {
     const opts = baseDispOrOptions;
@@ -298,6 +469,11 @@ export function calibrateDepthWithStereoSBS(
     if (opts.rightDaDepth !== undefined) rightDaDepth = opts.rightDaDepth;
     if (opts.conf0 !== undefined) conf0 = opts.conf0;
     if (opts.conf1 !== undefined) conf1 = opts.conf1;
+    if (opts.rightIsRectified !== undefined) rightIsRectified = opts.rightIsRectified;
+    if (opts.asymmetricSearch !== undefined) asymmetricSearch = opts.asymmetricSearch;
+    if (opts.useGuidedFilter !== undefined) useGuidedFilter = opts.useGuidedFilter;
+    if (opts.guidedFilterRadius !== undefined) guidedFilterRadius = opts.guidedFilterRadius;
+    if (opts.guidedFilterEps !== undefined) guidedFilterEps = opts.guidedFilterEps;
   } else {
     baseDisp = baseDispOrOptions;
     if (extraOptions) {
@@ -309,6 +485,11 @@ export function calibrateDepthWithStereoSBS(
       if (extraOptions.rightDaDepth !== undefined) rightDaDepth = extraOptions.rightDaDepth;
       if (extraOptions.conf0 !== undefined) conf0 = extraOptions.conf0;
       if (extraOptions.conf1 !== undefined) conf1 = extraOptions.conf1;
+      if (extraOptions.rightIsRectified !== undefined) rightIsRectified = extraOptions.rightIsRectified;
+      if (extraOptions.asymmetricSearch !== undefined) asymmetricSearch = extraOptions.asymmetricSearch;
+      if (extraOptions.useGuidedFilter !== undefined) useGuidedFilter = extraOptions.useGuidedFilter;
+      if (extraOptions.guidedFilterRadius !== undefined) guidedFilterRadius = extraOptions.guidedFilterRadius;
+      if (extraOptions.guidedFilterEps !== undefined) guidedFilterEps = extraOptions.guidedFilterEps;
     }
   }
   void alphaConfidence;
@@ -358,8 +539,47 @@ export function calibrateDepthWithStereoSBS(
   }
 
   // --------------------------------------------------------------------------
-  // STEP A: High-Confidence Stereo Anchors
+  // STEP A: Auto-Verified Base Disparity Sweep & High-Confidence Stereo Anchors
   // --------------------------------------------------------------------------
+  const isAsymmetric = asymmetricSearch === true;
+  let refinedBaseDisp = baseDisp;
+
+  if (isAsymmetric) {
+    // Fast 1D coarse horizontal MAD check in [baseDisp - 6, baseDisp + 6]
+    let bestMad = Infinity;
+    for (let d = baseDisp - 6; d <= baseDisp + 6; d++) {
+      let sumDiff = 0;
+      let count = 0;
+      for (let y = 4; y < eyeHeight - 4; y += 4) {
+        const rowOffset = y * eyeWidth;
+        for (let x = 4; x < eyeWidth - 4; x += 4) {
+          const xr = x - d;
+          if (xr >= 0 && xr < eyeWidth) {
+            sumDiff += Math.abs(leftLum[rowOffset + x] - rightLum[rowOffset + xr]);
+            count++;
+          }
+        }
+      }
+      if (count > 0) {
+        const mad = sumDiff / count;
+        if (mad < bestMad) {
+          bestMad = mad;
+          refinedBaseDisp = d;
+        }
+      }
+    }
+  }
+
+  // Asymmetric 3DS disparity search window: covers background infinity down to -74px and foreground pop-out to -45px
+  const dispMin = isAsymmetric
+    ? Math.round(refinedBaseDisp - Math.max(8, Math.round(maxDisp * 0.45)))
+    : Math.round(baseDisp - maxDisp);
+  const dispMax = isAsymmetric
+    ? Math.round(refinedBaseDisp + Math.max(26, Math.round(maxDisp * 1.65)))
+    : Math.round(baseDisp + maxDisp);
+  const dispSpan = dispMax - dispMin;
+  const invDispSpan = dispSpan > 0 ? 1.0 / dispSpan : 1.0;
+
   const anchorNormDisp = new Float32Array(eyeWidth * eyeHeight);
   anchorNormDisp.fill(-1);
   const anchorConf = new Float32Array(eyeWidth * eyeHeight);
@@ -369,11 +589,6 @@ export function calibrateDepthWithStereoSBS(
   const anchorDa: number[] = [];
   const anchorNorm: number[] = [];
   const anchorWeights: number[] = [];
-
-  const dispMin = Math.round(baseDisp - maxDisp);
-  const dispMax = Math.round(baseDisp + maxDisp);
-  const dispSpan = dispMax - dispMin;
-  const invDispSpan = dispSpan > 0 ? 1.0 / dispSpan : 1.0;
 
   for (let y = 2; y < eyeHeight - 2; y += step) {
     const rowOffset = y * eyeWidth;
@@ -397,7 +612,7 @@ export function calibrateDepthWithStereoSBS(
 
       let bestSAD = Infinity;
       let secondBestSAD = Infinity;
-      let bestD = baseDisp;
+      let bestD = refinedBaseDisp;
 
       for (let d = dispMin; d <= dispMax; d++) {
         const xr = x - d;
@@ -563,7 +778,6 @@ export function calibrateDepthWithStereoSBS(
 
     if (normErr2 < normErr1) {
       // Inverted depth yielded lower photometric reconstruction error!
-      // a2 * (1 - D) + b2 = -a2 * D + (a2 + b2)
       scaleA = -fit2.a;
       shiftB = fit2.a + fit2.b;
     } else {
@@ -573,8 +787,7 @@ export function calibrateDepthWithStereoSBS(
   }
 
   // --------------------------------------------------------------------------
-  // STEP C: Calibrated Depth Mapping & Percentile Contrast Stretching
-  // Multi-view stereo consensus fusion if right eye depth is present
+  // STEP C: Calibrated Depth Mapping, Multi-View Consensus & Local Stereo Residual Fusion
   // --------------------------------------------------------------------------
   const calibratedFloat = new Float32Array(eyeWidth * eyeHeight);
   for (let y = 0; y < eyeHeight; y++) {
@@ -587,7 +800,10 @@ export function calibrateDepthWithStereoSBS(
         // Physical stereo disparity from calibrated left depth
         const d0CalNorm = Math.max(0, Math.min(1, scaleA * d0 + shiftB));
         const disp = dispMin + d0CalNorm * dispSpan;
-        const xr = Math.max(0, Math.min(eyeWidth - 1, Math.round(x - disp)));
+        // When rightDaDepth comes from pre-rectified Right Eye, coordinate is already shifted by baseDisp
+        const xr = rightIsRectified
+          ? Math.max(0, Math.min(eyeWidth - 1, Math.round(x - (disp - baseDisp))))
+          : Math.max(0, Math.min(eyeWidth - 1, Math.round(x - disp)));
         const d1 = rightDaDepth[rowOffset + xr];
 
         const c0 = conf0 ? Math.max(1e-4, conf0[idx]) : 1.0;
@@ -604,14 +820,38 @@ export function calibrateDepthWithStereoSBS(
       } else {
         calibratedFloat[idx] = scaleA * d0 + shiftB;
       }
+
+      // Blend local stereo disparity residual if high-confidence anchor
+      if (anchorConf[idx] > 0.25 && anchorNormDisp[idx] >= 0) {
+        const residual = anchorNormDisp[idx] - calibratedFloat[idx];
+        const blendWeight = Math.min(0.5, anchorConf[idx] * 0.6);
+        calibratedFloat[idx] += blendWeight * residual;
+      }
     }
+  }
+
+  // Fast O(N) Edge-Preserving Guided Filter propagation
+  let depthToQuantize: Float32Array = calibratedFloat;
+  if (useGuidedFilter) {
+    const normGuide = new Float32Array(eyeWidth * eyeHeight);
+    for (let i = 0; i < normGuide.length; i++) {
+      normGuide[i] = leftLum[i] / 255.0;
+    }
+    depthToQuantize = guidedFilterDepth(
+      calibratedFloat,
+      normGuide,
+      eyeWidth,
+      eyeHeight,
+      guidedFilterRadius,
+      guidedFilterEps
+    );
   }
 
   // Compute robust percentiles (p2 and p98) to stretch depth map to full [0, 255] dynamic range
   let p2 = 0.0;
   let p98 = 1.0;
-  if (contrastStretch && calibratedFloat.length > 0) {
-    const sorted = Float32Array.from(calibratedFloat).sort();
+  if (contrastStretch && depthToQuantize.length > 0) {
+    const sorted = Float32Array.from(depthToQuantize).sort();
     p2 = sorted[Math.floor(sorted.length * 0.02)];
     p98 = sorted[Math.floor(sorted.length * 0.98)];
   }
@@ -619,10 +859,10 @@ export function calibrateDepthWithStereoSBS(
   const invRange = range > 1e-5 ? 1.0 / range : 1.0;
 
   const refinedDepthUint8 = new Uint8Array(eyeWidth * eyeHeight);
-  for (let i = 0; i < calibratedFloat.length; i++) {
+  for (let i = 0; i < depthToQuantize.length; i++) {
     const norm = contrastStretch
-      ? Math.max(0, Math.min(1, (calibratedFloat[i] - p2) * invRange))
-      : Math.max(0, Math.min(1, calibratedFloat[i]));
+      ? Math.max(0, Math.min(1, (depthToQuantize[i] - p2) * invRange))
+      : Math.max(0, Math.min(1, depthToQuantize[i]));
     refinedDepthUint8[i] = Math.round(norm * 255);
   }
 
@@ -640,7 +880,7 @@ export function calibrateDepthWithStereoSBS(
     const rowOffset = y * eyeWidth;
     for (let x = 0; x < eyeWidth; x++) {
       const idx = rowOffset + x;
-      const dNorm = Math.max(0, Math.min(1, calibratedFloat[idx]));
+      const dNorm = Math.max(0, Math.min(1, depthToQuantize[idx]));
       const disp = dispMin + dNorm * dispSpan;
       const xr = Math.round(x - disp);
 
@@ -665,7 +905,7 @@ export function calibrateDepthWithStereoSBS(
 }
 
 /**
- * Controller orchestrating DepthAnythingV2 Web Worker inference and SBS photogrammetric stereo calibration.
+ * Controller orchestrating DepthAnythingV3 Web Worker inference and SBS photogrammetric stereo calibration.
  * Non-blocking isBusy flag ensures the 60 FPS WebGL render loop never stalls.
  */
 export class DepthAnythingController {
@@ -674,7 +914,7 @@ export class DepthAnythingController {
   private busy: boolean = false;
   private baseDisp: number = 0;
   private maxDisp: number = 16;
-  private modelVersion: 'v3' | 'v2' = 'v3';
+  private modelVersion: 'v3' = 'v3';
   private options: DepthAnythingControllerOptions;
   private frameCounter: number = 0;
   private lastFpsTime: number = 0;
@@ -698,8 +938,8 @@ export class DepthAnythingController {
     onDepthMapReady?: DepthMapReadyCallback
   ) {
     this.options = { ...options };
-    this.modelVersion = options?.modelVersion || 'v3';
-    if (this.options.inputSize === undefined) this.options.inputSize = 504;
+    this.modelVersion = 'v3';
+    if (this.options.inputSize === undefined) this.options.inputSize = 392;
     if (this.options.expandRadius === undefined && this.options.dilateRadius === undefined) {
       this.options.expandRadius = 1;
     }
@@ -727,19 +967,16 @@ export class DepthAnythingController {
     return this.initialized;
   }
 
-  public getModelVersion(): 'v3' | 'v2' {
+  public getModelVersion(): 'v3' {
     return this.modelVersion;
   }
 
-  public async setModelVersion(version: 'v3' | 'v2'): Promise<void> {
-    if (this.modelVersion === version && this.initialized) {
-      return;
-    }
-    this.modelVersion = version;
-    this.options.modelVersion = version;
-    this.options.inputSize = version === 'v2' ? 518 : 504;
+  public async setModelVersion(_version: 'v3' | string): Promise<void> {
+    this.modelVersion = 'v3';
+    this.options.modelVersion = 'v3';
+    this.options.inputSize = this.options.inputSize || 392;
 
-    const defaultModel = version === 'v3' ? '/models/depthanythingv3.onnx' : '/models/depthanythingv2.onnx';
+    const defaultModel = '/models/depthanythingv3.onnx';
     const modelPath = typeof window !== 'undefined'
       ? new URL('.' + defaultModel, window.location.href).href
       : defaultModel;
@@ -847,69 +1084,52 @@ export class DepthAnythingController {
         return;
       }
 
-      const tryInitModel = async (version: 'v3' | 'v2'): Promise<void> => {
-        const defaultModel = version === 'v3' ? '/models/depthanythingv3.onnx' : '/models/depthanythingv2.onnx';
-        const defaultModelPath = typeof window !== 'undefined'
-          ? new URL('.' + defaultModel, window.location.href).href
-          : defaultModel;
+      const defaultModel = '/models/depthanythingv3.onnx';
+      const defaultModelPath = typeof window !== 'undefined'
+        ? new URL('.' + defaultModel, window.location.href).href
+        : defaultModel;
 
-        const defaultWasmPaths = typeof window !== 'undefined'
-          ? new URL('./onnx-wasm/', window.location.href).href
-          : '/onnx-wasm/';
+      const defaultWasmPaths = typeof window !== 'undefined'
+        ? new URL('./onnx-wasm/', window.location.href).href
+        : '/onnx-wasm/';
 
-        const initMsg: WorkerInitMessage = {
-          type: 'init',
-          wasmPaths: this.options.wasmPaths || defaultWasmPaths,
-          modelPath: this.options.modelPath || defaultModelPath,
-          modelPathWebGPU: this.options.modelPathWebGPU,
-          preferWebGPU: true,
-        };
-
-        if (!this.worker) {
-          if (this.options.worker) {
-            this.worker = this.options.worker;
-          } else if (this.options.workerUrl) {
-            this.worker = new Worker(this.options.workerUrl, { type: 'module' });
-          } else {
-            this.worker = new Worker(new URL('./depthAnythingWorker.ts', import.meta.url), { type: 'module' });
-          }
-          this.setupWorkerListeners();
-        }
-
-        await new Promise<void>((resolve, reject) => {
-          const timeout = setTimeout(() => resolve(), 15000);
-          const initHandler = (e: MessageEvent<WorkerOutMessage>) => {
-            if (e.data.type === 'initDone') {
-              clearTimeout(timeout);
-              this.currentBackend = e.data.backend;
-              this.initialized = true;
-              this.worker?.removeEventListener('message', initHandler);
-              resolve();
-            } else if (e.data.type === 'error') {
-              clearTimeout(timeout);
-              this.worker?.removeEventListener('message', initHandler);
-              reject(new Error(e.data.error));
-            }
-          };
-          this.worker?.addEventListener('message', initHandler);
-          this.worker?.postMessage(initMsg);
-        });
+      const initMsg: WorkerInitMessage = {
+        type: 'init',
+        wasmPaths: this.options.wasmPaths || defaultWasmPaths,
+        modelPath: this.options.modelPath || defaultModelPath,
+        modelPathWebGPU: this.options.modelPathWebGPU,
+        preferWebGPU: true,
       };
 
-      try {
-        await tryInitModel(this.modelVersion);
-      } catch (err) {
-        if (this.modelVersion === 'v3') {
-          console.warn('DepthAnythingController: v3 init failed, falling back to v2:', err);
-          this.modelVersion = 'v2';
-          this.options.modelVersion = 'v2';
-          this.options.modelPath = undefined;
-          await tryInitModel('v2');
+      if (!this.worker) {
+        if (this.options.worker) {
+          this.worker = this.options.worker;
+        } else if (this.options.workerUrl) {
+          this.worker = new Worker(this.options.workerUrl, { type: 'module' });
         } else {
-          console.warn('DepthAnythingController init error:', err);
-          this.initialized = true;
+          this.worker = new Worker(new URL('./depthAnythingWorker.ts', import.meta.url), { type: 'module' });
         }
+        this.setupWorkerListeners();
       }
+
+      await new Promise<void>((resolve, reject) => {
+        const timeout = setTimeout(() => resolve(), 15000);
+        const initHandler = (e: MessageEvent<WorkerOutMessage>) => {
+          if (e.data.type === 'initDone') {
+            clearTimeout(timeout);
+            this.currentBackend = e.data.backend;
+            this.initialized = true;
+            this.worker?.removeEventListener('message', initHandler);
+            resolve();
+          } else if (e.data.type === 'error') {
+            clearTimeout(timeout);
+            this.worker?.removeEventListener('message', initHandler);
+            reject(new Error(e.data.error));
+          }
+        };
+        this.worker?.addEventListener('message', initHandler);
+        this.worker?.postMessage(initMsg);
+      });
     })();
 
     return this.initPromise;
@@ -961,6 +1181,11 @@ export class DepthAnythingController {
           rightDaDepth: result.rawRightDepth,
           conf0: result.conf0 ?? result.confidence,
           conf1: result.conf1,
+          rightIsRectified: baseDisp !== 0,
+          asymmetricSearch: this.options.asymmetricSearch,
+          useGuidedFilter: this.options.useGuidedFilter,
+          guidedFilterRadius: this.options.guidedFilterRadius,
+          guidedFilterEps: this.options.guidedFilterEps,
         }
       );
 
@@ -983,8 +1208,9 @@ export class DepthAnythingController {
         fps: Math.round(this.currentFps * 10) / 10,
         frameId: result.frameId || this.frameCounter,
         anchorCount: calResult.anchorCount,
-        modelVersion: this.modelVersion,
-        numViews: result.numViews ?? (this.modelVersion === 'v3' ? 2 : 1),
+        modelVersion: 'v3',
+        v3BaselinePx: result.v3BaselinePx,
+        numViews: result.numViews ?? 2,
       };
 
       this.lastTelemetry = telemetry;
@@ -1025,7 +1251,7 @@ export class DepthAnythingController {
 
     // Fast-path: If pre-computed timeline has frame-accurate depth for video.currentTime, serve with zero desync!
     if (this.timeline) {
-      const depth = this.timeline.getDepthAtTime(video.currentTime, this.modelVersion);
+      const depth = this.timeline.getDepthAtTime(video.currentTime, 'v3');
       if (depth) {
         const eyeWidth = Math.floor(sbsW / 2);
         const eyeHeight = sbsH;
@@ -1039,7 +1265,7 @@ export class DepthAnythingController {
           fps: Math.round(this.currentFps * 10) / 10,
           frameId: Math.round(video.currentTime * this.timeline.getFps()),
           anchorCount: 0,
-          modelVersion: this.modelVersion,
+          modelVersion: 'v3',
           numViews: 2,
         };
         this.lastTelemetry = telemetry;
@@ -1110,8 +1336,8 @@ export class DepthAnythingController {
     this.pendingMaxDisp = effectiveMaxDisp;
 
     const leftEyeRgba = extractLeftEyeRgba(sbsRgba, sbsWidth, sbsHeight);
-    const rightEyeRgba = extractRightEyeRgba(sbsRgba, sbsWidth, sbsHeight);
-    const inputSize = this.options.inputSize || 504;
+    const rightEyeRgba = extractRectifiedRightEyeRgba(sbsRgba, sbsWidth, sbsHeight, effectiveBaseDisp);
+    const inputSize = this.options.inputSize || 392;
 
     if (this.options.customInfer) {
       this.options
@@ -1121,6 +1347,10 @@ export class DepthAnythingController {
             type: 'depthReady',
             frameId: this.frameCounter,
             rawDepth: res.rawDepth,
+            rawRightDepth: res.rawRightDepth,
+            conf0: res.conf0,
+            conf1: res.conf1,
+            v3BaselinePx: res.v3BaselinePx,
             numViews: rightEyeRgba ? 2 : 1,
             width: eyeWidth,
             height: eyeHeight,

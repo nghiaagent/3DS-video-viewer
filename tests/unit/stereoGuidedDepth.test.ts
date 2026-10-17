@@ -6,7 +6,8 @@ import {
   expandDepthMap,
   resampleDepthMap,
   extractLeftEyeRgba,
-  extractRightEyeRgba,
+  extractRectifiedRightEyeRgba,
+  guidedFilterDepth,
   computeZeroMeanSAD,
   DepthAnythingController,
   VideoDepthTimeline,
@@ -14,6 +15,7 @@ import {
 import {
   initSession,
   runDepthInference,
+  preprocessRgbaToPlanarTensor,
 } from '../../src/depth/depthAnythingWorker.js';
 
 /**
@@ -103,6 +105,100 @@ describe('stereoGuidedDepth & DepthAnything Integration', () => {
       expect(leftEye[i]).toBe(100);
       expect(leftEye[i + 3]).toBe(255);
     }
+  });
+
+  it('preprocessRgbaToPlanarTensor calculates exact 2:1 multiple-of-14 dimensions (392x196 and 504x252) with zero letterbox waste', () => {
+    const srcW = 480;
+    const srcH = 240;
+    const rgba = new Uint8Array(srcW * srcH * 4).fill(128);
+
+    // 1. Test targetSize = 392 -> modelW = 392, modelH = 196 (exact 2:1 ratio, 28*14 and 14*14)
+    const res392 = preprocessRgbaToPlanarTensor(rgba, srcW, srcH, 392, true);
+    expect(res392.modelW).toBe(392);
+    expect(res392.modelH).toBe(196);
+    expect(res392.planarData.length).toBe(3 * 392 * 196);
+    expect(res392.letterbox.offsetX).toBe(0);
+    expect(res392.letterbox.offsetY).toBe(0);
+    expect(res392.letterbox.scaledW).toBe(392);
+    expect(res392.letterbox.scaledH).toBe(196);
+
+    // 2. Test targetSize = 504 -> modelW = 504, modelH = 252 (exact 2:1 ratio, 36*14 and 18*14)
+    const res504 = preprocessRgbaToPlanarTensor(rgba, srcW, srcH, 504, true);
+    expect(res504.modelW).toBe(504);
+    expect(res504.modelH).toBe(252);
+    expect(res504.planarData.length).toBe(3 * 504 * 252);
+    expect(res504.letterbox.offsetX).toBe(0);
+    expect(res504.letterbox.offsetY).toBe(0);
+
+    // 3. Test targetSize = 336 -> modelW = 336, modelH = 168 (exact 2:1 ratio, 24*14 and 12*14)
+    const res336 = preprocessRgbaToPlanarTensor(rgba, srcW, srcH, 336, true);
+    expect(res336.modelW).toBe(336);
+    expect(res336.modelH).toBe(168);
+    expect(res336.planarData.length).toBe(3 * 336 * 168);
+    expect(res336.letterbox.offsetX).toBe(0);
+    expect(res336.letterbox.offsetY).toBe(0);
+  });
+
+  it('extractRectifiedRightEyeRgba horizontally shifts Right Eye pixels by baseDisp for convergence plane alignment', () => {
+    const sbsW = 20;
+    const sbsH = 2;
+    const eyeW = 10;
+    const sbsRgba = new Uint8Array(sbsW * sbsH * 4);
+
+    // Fill Right Eye with distinct value equal to its eye coordinate xr: xr * 10
+    for (let y = 0; y < sbsH; y++) {
+      for (let xr = 0; xr < eyeW; xr++) {
+        const idx = (y * sbsW + eyeW + xr) * 4;
+        sbsRgba[idx] = xr * 10;
+        sbsRgba[idx + 1] = xr * 10;
+        sbsRgba[idx + 2] = xr * 10;
+        sbsRgba[idx + 3] = 255;
+      }
+    }
+
+    // With baseDisp = -2: xr = clamp(x - (-2), 0, eyeW - 1) = clamp(x + 2, 0, 9)
+    const rectified = extractRectifiedRightEyeRgba(sbsRgba, sbsW, sbsH, -2);
+    expect(rectified.length).toBe(eyeW * sbsH * 4);
+
+    // At x = 0, xr should be 0 + 2 = 2 (value 20)
+    expect(rectified[0]).toBe(20);
+    // At x = 3, xr should be 3 + 2 = 5 (value 50)
+    expect(rectified[3 * 4]).toBe(50);
+    // At x = 7, xr should be 7 + 2 = 9 (value 90)
+    expect(rectified[7 * 4]).toBe(90);
+    // At x = 9, xr clamped to 9 (value 90)
+    expect(rectified[9 * 4]).toBe(90);
+  });
+
+  it('guidedFilterDepth smoothly filters depth while preserving sharp object edges in < 5ms', () => {
+    const w = 480;
+    const h = 240;
+    const depth = new Float32Array(w * h);
+    const guide = new Float32Array(w * h);
+
+    // Guide has a razor-sharp vertical step edge at x = 240 (0.1 on left, 0.9 on right)
+    // Depth has a noisy transition around x = 240
+    for (let y = 0; y < h; y++) {
+      const row = y * w;
+      for (let x = 0; x < w; x++) {
+        guide[row + x] = x < 240 ? 0.1 : 0.9;
+        depth[row + x] = x < 235 ? 0.2 : (x > 245 ? 0.8 : 0.5);
+      }
+    }
+
+    const t0 = performance.now();
+    const filtered = guidedFilterDepth(depth, guide, w, h, 4, 1e-3);
+    const elapsed = performance.now() - t0;
+
+    expect(filtered.length).toBe(w * h);
+    expect(elapsed).toBeLessThan(50); // fast separable O(1) filter
+
+    // Verify edge preservation across x = 240
+    const valLeft = filtered[100 * w + 234];
+    const valRight = filtered[100 * w + 246];
+    expect(valLeft).toBeLessThan(0.4);
+    expect(valRight).toBeGreaterThan(0.6);
+    expect(valLeft).toBeLessThan(valRight);
   });
 
   it('resampleDepthMap smoothly interpolates Float32 depth maps', () => {
@@ -203,8 +299,6 @@ describe('stereoGuidedDepth & DepthAnything Integration', () => {
     expect(result.width).toBe(eyeW);
     expect(result.height).toBe(eyeH);
     expect(result.anchorCount).toBeGreaterThan(10);
-
-    // The scale factor should recover approx 2.0 (since 0.5 * 2.0 = 1.0)
     expect(result.scaleA).toBeGreaterThan(1.4);
     expect(result.scaleA).toBeLessThan(2.6);
 
@@ -361,7 +455,7 @@ describe('stereoGuidedDepth & DepthAnything Integration', () => {
     controller.destroy();
   });
 
-  it('DepthAnythingController supports modelVersion v3 and v2 switching and defaults', async () => {
+  it('DepthAnythingController uses modelVersion v3 exclusively', async () => {
     const controller = new DepthAnythingController({
       customInfer: async () => ({
         rawDepth: new Float32Array(100),
@@ -374,17 +468,18 @@ describe('stereoGuidedDepth & DepthAnything Integration', () => {
     await controller.init();
     expect(controller.isReady()).toBe(true);
 
-    await controller.setModelVersion('v2');
-    expect(controller.getModelVersion()).toBe('v2');
-
     await controller.setModelVersion('v3');
+    expect(controller.getModelVersion()).toBe('v3');
+
+    // Setting backward-compatible version maintains v3
+    await controller.setModelVersion('v2');
     expect(controller.getModelVersion()).toBe('v3');
 
     controller.destroy();
   });
 
-  it('runs true ONNX inference with DepthAnythingV2 model in public/models/ at 504px if present', async () => {
-    const modelPath = path.resolve(__dirname, '../../public/models/depthanythingv2.onnx');
+  it('runs true ONNX inference with DepthAnythingV3 model in public/models/ at 392px rectangular resolution if present', async () => {
+    const modelPath = path.resolve(__dirname, '../../public/models/depthanythingv3.onnx');
     if (!fs.existsSync(modelPath)) {
       console.log('Skipping real ONNX model test (model file not found)');
       return;
@@ -399,9 +494,9 @@ describe('stereoGuidedDepth & DepthAnything Integration', () => {
     expect(session).toBeDefined();
     expect(backend).toBe('wasm');
 
-    // Synthetic 120x60 Left Eye image
-    const w = 120;
-    const h = 60;
+    // 480x240 Left Eye image
+    const w = 480;
+    const h = 240;
     const testRgba = new Uint8Array(w * h * 4);
     for (let i = 0; i < testRgba.length; i += 4) {
       testRgba[i] = 128;
@@ -410,9 +505,10 @@ describe('stereoGuidedDepth & DepthAnything Integration', () => {
       testRgba[i + 3] = 255;
     }
 
-    const { rawDepth, inferenceTimeMs } = await runDepthInference(session, testRgba, w, h, 504);
+    const { rawDepth, inferenceTimeMs, numViews } = await runDepthInference(session, testRgba, w, h, 392);
     expect(rawDepth.length).toBe(w * h);
     expect(inferenceTimeMs).toBeGreaterThan(0);
+    expect(numViews).toBe(1);
 
     // Check normalization bounds
     for (let i = 0; i < rawDepth.length; i++) {
@@ -421,13 +517,12 @@ describe('stereoGuidedDepth & DepthAnything Integration', () => {
     }
   });
 
-  it('runs true ONNX inference with DepthAnythingV3 and DepthAnythingV2 at 504px and saves diagnostic heatmaps', async () => {
-    const v2Path = path.resolve(__dirname, '../../public/models/depthanythingv2.onnx');
+  it('runs true ONNX inference with DepthAnythingV3 at 392px rectangular resolution and saves diagnostic heatmaps', async () => {
     const v3Path = path.resolve(__dirname, '../../public/models/depthanythingv3.onnx');
     const wasmPaths = path.resolve(__dirname, '../../node_modules/onnxruntime-web/dist') + '/';
 
-    if (!fs.existsSync(v2Path) || !fs.existsSync(v3Path)) {
-      console.log('Skipping dual V2/V3 test (models not found)');
+    if (!fs.existsSync(v3Path)) {
+      console.log('Skipping V3 test (model not found)');
       return;
     }
 
@@ -497,23 +592,27 @@ describe('stereoGuidedDepth & DepthAnything Integration', () => {
       } catch {}
     };
 
-    // 1. Run DepthAnythingV3 inference at 504px
+    // 1. Run DepthAnythingV3 inference at 392px rectangular resolution (392x196)
     const { session: sessionV3 } = await initSession({
       modelPath: v3Path,
       wasmPaths,
       preferWebGPU: false,
     });
-    const rightRgba = extractRightEyeRgba(sbsRgba, w * 2, h);
+    const rightRgba = extractRectifiedRightEyeRgba(sbsRgba, w * 2, h, -70);
 
-    // 1. Run DepthAnythingV3 multi-view stereo inference with both Left and Right views
-    const inferV3 = await runDepthInference(sessionV3, leftRgba, w, h, 504, rightRgba);
+    // Multi-view stereo inference with Left and pre-rectified Right views
+    const inferV3 = await runDepthInference(sessionV3, leftRgba, w, h, 392, rightRgba);
     expect(inferV3.rawDepth.length).toBe(w * h);
     expect(inferV3.numViews).toBe(2);
+    expect(inferV3.rawRightDepth).toBeDefined();
+
     const calV3 = calibrateDepthWithStereoSBS(inferV3.rawDepth, sbsRgba, -70, 16, w * 2, h, {
       expandRadius: 1,
       rightDaDepth: inferV3.rawRightDepth,
       conf0: inferV3.conf0,
       conf1: inferV3.conf1,
+      rightIsRectified: true,
+      useGuidedFilter: true,
     });
     expect(calV3.width).toBe(w);
     expect(calV3.height).toBe(h);
@@ -530,44 +629,26 @@ describe('stereoGuidedDepth & DepthAnything Integration', () => {
     expect(minV3).toBeLessThanOrEqual(25);
     expect(maxV3).toBeGreaterThanOrEqual(230);
 
-    // 2. Run DepthAnythingV2 inference at 504px (monocular)
-    const { session: sessionV2 } = await initSession({
-      modelPath: v2Path,
-      wasmPaths,
-      preferWebGPU: false,
-    });
-    const inferV2 = await runDepthInference(sessionV2, leftRgba, w, h, 504);
-    expect(inferV2.rawDepth.length).toBe(w * h);
-    expect(inferV2.numViews).toBe(1);
-
-    const calV2 = calibrateDepthWithStereoSBS(inferV2.rawDepth, sbsRgba, -70, 16, w * 2, h, { expandRadius: 1 });
-    expect(calV2.width).toBe(w);
-    expect(calV2.height).toBe(h);
-    expect(calV2.sbsReconstructionMae).toBeLessThan(15.0);
-
-    // 3. Save diagnostic heatmaps to scratch directory
+    // 2. Save diagnostic heatmap
     const scratchDir = '/Users/nghiaagent/.gemini/antigravity/brain/a683cc2e-6fb4-45b1-933b-9fcd06ec25f2/scratch';
     if (fs.existsSync(scratchDir)) {
       const v3Heatmap = path.join(scratchDir, 'depthanything_v3_heatmap.png');
-      const v2Heatmap = path.join(scratchDir, 'depthanything_v2_heatmap.png');
       saveHeatmap(calV3.calibratedDepth, w, h, v3Heatmap);
-      saveHeatmap(calV2.calibratedDepth, w, h, v2Heatmap);
       expect(fs.existsSync(v3Heatmap)).toBe(true);
-      expect(fs.existsSync(v2Heatmap)).toBe(true);
     }
   }, 30000);
 
-  it('runs dual-perspective (Left + Right eye) consensus depth inference on DepthAnythingV2', async () => {
-    const v2Path = path.resolve(__dirname, '../../public/models/depthanythingv2.onnx');
+  it('runs dual-perspective (Left + Right eye) consensus depth inference on DepthAnythingV3 with pre-rectified Right Eye', async () => {
+    const v3Path = path.resolve(__dirname, '../../public/models/depthanythingv3.onnx');
     const wasmPaths = path.resolve(__dirname, '../../node_modules/onnxruntime-web/dist') + '/';
 
-    if (!fs.existsSync(v2Path)) {
-      console.log('Skipping dual-view V2 test (model not found)');
+    if (!fs.existsSync(v3Path)) {
+      console.log('Skipping dual-view V3 test (model not found)');
       return;
     }
 
-    const { session: sessionV2 } = await initSession({
-      modelPath: v2Path,
+    const { session: sessionV3 } = await initSession({
+      modelPath: v3Path,
       wasmPaths,
       preferWebGPU: false,
     });
@@ -583,7 +664,7 @@ describe('stereoGuidedDepth & DepthAnything Integration', () => {
     if (fs.existsSync(rawSbsFile)) {
       sbsRgba = new Uint8Array(fs.readFileSync(rawSbsFile));
       leftRgba = extractLeftEyeRgba(sbsRgba, eyeW * 2, eyeH);
-      rightRgba = extractRightEyeRgba(sbsRgba, eyeW * 2, eyeH);
+      rightRgba = extractRectifiedRightEyeRgba(sbsRgba, eyeW * 2, eyeH, baseDisp);
     } else {
       eyeW = 120;
       eyeH = 60;
@@ -591,11 +672,11 @@ describe('stereoGuidedDepth & DepthAnything Integration', () => {
       const syn = createSyntheticSBSFrame(eyeW, eyeH, 0, 16, 6, -6);
       sbsRgba = syn.sbsRgba;
       leftRgba = extractLeftEyeRgba(sbsRgba, eyeW * 2, eyeH);
-      rightRgba = extractRightEyeRgba(sbsRgba, eyeW * 2, eyeH);
+      rightRgba = extractRectifiedRightEyeRgba(sbsRgba, eyeW * 2, eyeH, baseDisp);
     }
 
-    // Pass both Left Eye and Right Eye to V2 at fast 336px
-    const infer = await runDepthInference(sessionV2, leftRgba, eyeW, eyeH, 336, rightRgba);
+    // Pass both Left Eye and pre-rectified Right Eye to V3 at 392px
+    const infer = await runDepthInference(sessionV3, leftRgba, eyeW, eyeH, 392, rightRgba);
     expect(infer.numViews).toBe(2);
     expect(infer.rawDepth).toBeDefined();
     expect(infer.rawDepth.length).toBe(eyeW * eyeH);
@@ -606,6 +687,8 @@ describe('stereoGuidedDepth & DepthAnything Integration', () => {
     const cal = calibrateDepthWithStereoSBS(infer.rawDepth, sbsRgba, baseDisp, 16, eyeW * 2, eyeH, {
       expandRadius: 1,
       rightDaDepth: infer.rawRightDepth,
+      rightIsRectified: baseDisp !== 0,
+      useGuidedFilter: true,
     });
 
     expect(cal.width).toBe(eyeW);
@@ -616,7 +699,7 @@ describe('stereoGuidedDepth & DepthAnything Integration', () => {
     }
   });
 
-  it('VideoDepthTimeline pre-computes frame-accurate dual-perspective consensus depth timelines for both V3 and V2', async () => {
+  it('VideoDepthTimeline pre-computes frame-accurate consensus depth timeline for DepthAnythingV3 with parallel worker pool and edge-guided interpolation', async () => {
     const eyeW = 60;
     const eyeH = 30;
     const sbsW = eyeW * 2;
@@ -638,20 +721,15 @@ describe('stereoGuidedDepth & DepthAnything Integration', () => {
 
     const timeline = new VideoDepthTimeline({
       fps,
-      inputSize: 336,
+      inputSize: 392,
       baseDisp: 0,
       maxDisp: 16,
       frameExtractor: async (_timeSec, frameIndex) => {
         return mockFrames[frameIndex] || mockFrames[0];
       },
-      customInfer: async (_leftRgba, w, h, _size, rightRgba, modelVersion) => {
-        // Mock dual-perspective neural pass returning depth arrays for left and right
-        const leftDepth = new Float32Array(w * h);
-        const rightDepth = rightRgba ? new Float32Array(w * h) : undefined;
-        for (let i = 0; i < leftDepth.length; i++) {
-          leftDepth[i] = modelVersion === 'v3' ? 0.6 : 0.5;
-          if (rightDepth) rightDepth[i] = modelVersion === 'v3' ? 0.6 : 0.5;
-        }
+      customInfer: async (_leftRgba, w, h, _size, rightRgba) => {
+        const leftDepth = new Float32Array(w * h).fill(0.6);
+        const rightDepth = rightRgba ? new Float32Array(w * h).fill(0.6) : undefined;
         return {
           rawDepth: leftDepth,
           rawRightDepth: rightDepth,
@@ -679,13 +757,11 @@ describe('stereoGuidedDepth & DepthAnything Integration', () => {
       { initialKeyframes: 5, runFullStreamInBackground: true }
     );
 
-    // Initial pre-pass progress was reported
     expect(progressReports.length).toBeGreaterThan(0);
     expect(timeline.isReady()).toBe(true);
 
-    // Keyframes were computed for both V3 and V2
+    // Keyframes were computed for V3
     expect(timeline.hasFrame(0, 'v3')).toBe(true);
-    expect(timeline.hasFrame(0, 'v2')).toBe(true);
 
     // Exact keyframe query at t = 0.0s
     const depthAtZeroV3 = timeline.getDepthForTime(0.0, 'v3');
@@ -694,12 +770,8 @@ describe('stereoGuidedDepth & DepthAnything Integration', () => {
     expect(depthAtZeroV3!.frameIndex).toBe(0);
     expect(depthAtZeroV3!.depth.length).toBe(eyeW * eyeH);
 
-    const depthAtZeroV2 = timeline.getDepthForTime(0.0, 'v2');
-    expect(depthAtZeroV2).toBeDefined();
-    expect(depthAtZeroV2!.isExact).toBe(true);
-
     // Intermediate frame query at t = 0.05s (frame 1) before background worker finishes
-    // Temporal interpolation between keyframe 0 and keyframe 10 provides depth with zero desync!
+    // Edge-guided temporal interpolation between keyframes provides depth with zero ghosting!
     const depthInterpV3 = timeline.getDepthForTime(0.05, 'v3');
     expect(depthInterpV3).toBeDefined();
     expect(depthInterpV3!.depth.length).toBe(eyeW * eyeH);
@@ -710,7 +782,6 @@ describe('stereoGuidedDepth & DepthAnything Integration', () => {
     expect(progress.isComplete).toBe(true);
     expect(progress.completedFrames).toBe(totalFrames);
     expect(progress.v3Frames).toBe(totalFrames);
-    expect(progress.v2Frames).toBe(totalFrames);
 
     // Now frame 1 is exact!
     const depthExactV3 = timeline.getDepthForTime(0.05, 'v3');
@@ -730,23 +801,14 @@ describe('stereoGuidedDepth & DepthAnything Integration', () => {
       },
     });
 
-    // Query controller with video element at currentTime = 0.5s (frame 10)
     (mockVideo as any).currentTime = 0.5;
     const handled = await controller.processVideoFrame(mockVideo);
     expect(handled).toBe(true);
     expect(controllerCallbackDepth).toBeDefined();
     expect(controllerTelemetry).toBeDefined();
     expect(controllerTelemetry.backend).toBe('timeline-cache');
-    expect(controllerTelemetry.inferenceTimeMs).toBe(0); // 0.0ms instant timeline lookup!
+    expect(controllerTelemetry.inferenceTimeMs).toBe(0);
     expect(controllerTelemetry.modelVersion).toBe('v3');
-
-    // Switch model to v2 and query
-    await controller.setModelVersion('v2');
-    controllerCallbackDepth = null;
-    const handledV2 = await controller.processVideoFrame(mockVideo);
-    expect(handledV2).toBe(true);
-    expect(controllerCallbackDepth).toBeDefined();
-    expect(controllerTelemetry.modelVersion).toBe('v2');
 
     timeline.destroy();
     controller.destroy();
@@ -768,7 +830,7 @@ describe('stereoGuidedDepth & DepthAnything Integration', () => {
 
     const timeline = new VideoDepthTimeline({
       fps,
-      inputSize: 336,
+      inputSize: 392,
       frameExtractor: async (_timeSec, frameIndex) => mockFrames[frameIndex] || mockFrames[0],
       customInfer: async (_left, w, h) => ({
         rawDepth: new Float32Array(w * h).fill(0.5),
@@ -794,7 +856,6 @@ describe('stereoGuidedDepth & DepthAnything Integration', () => {
 
     for (let f = 0; f < totalFrames; f++) {
       expect(timeline.hasFrame(f, 'v3')).toBe(true);
-      expect(timeline.hasFrame(f, 'v2')).toBe(true);
     }
 
     timeline.destroy();

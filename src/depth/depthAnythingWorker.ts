@@ -6,7 +6,7 @@ export interface WorkerInitMessage {
   modelPath?: string;
   modelPathWebGPU?: string;
   preferWebGPU?: boolean;
-  modelVersion?: 'v3' | 'v2';
+  modelVersion?: 'v3';
 }
 
 export interface WorkerInferMessage {
@@ -16,18 +16,18 @@ export interface WorkerInferMessage {
   rightRgbaData?: Uint8Array;
   width: number;
   height: number;
-  size?: number; // model input resolution, default 504 (multiple of 14: 36 * 14)
+  size?: number; // model input resolution, default 392 (392x196: 28*14 x 14*14 exact 2:1)
 }
 
 export interface WorkerDepthResultMessage {
   type: 'depthReady';
   frameId?: number;
-  rawDepth: Float32Array; // View 0 (left) normalized [0, 1], resampled to original width x height
-  rawRightDepth?: Float32Array; // View 1 (right) normalized [0, 1]
+  rawDepth: Float32Array; // View 0 (left) joint inverse depth in [0, 1], resampled to original width x height
+  rawRightDepth?: Float32Array; // View 1 (right) joint inverse depth in [0, 1]
   conf0?: Float32Array;
   conf1?: Float32Array;
-  modelDepth?: Float32Array;
   confidence?: Float32Array;
+  v3BaselinePx?: number;
   numViews?: number;
   width: number;
   height: number;
@@ -52,30 +52,40 @@ let cachedBackend: 'webgpu' | 'wasm' = 'wasm';
 let isInitialized = false;
 
 /**
- * Bilinearly scales RGBA image to targetSize x targetSize planar RGB Float32Array (RRR...GGG...BBB).
- * Applies ImageNet normalization ((rgb - mean) / std) by default for sharpest ViT features.
- * Preserves aspect ratio using center letterboxing and edge clamping to eliminate border artifacts.
+ * Bilinearly scales RGBA image to native 2:1 rectangular ViT-14 resolution (modelW x modelH),
+ * ensuring modelW and modelH are multiples of 14 with ZERO letterbox waste when aspect ratios match.
+ * Applies ImageNet normalization ((rgb - mean) / std).
  */
 export function preprocessRgbaToPlanarTensor(
   rgba: Uint8Array,
   srcW: number,
   srcH: number,
-  targetSize: number,
+  targetSize: number | { targetW?: number; targetH?: number } = 392,
   normalizeImageNet: boolean = true
 ): {
   planarData: Float32Array;
+  modelW: number;
+  modelH: number;
   letterbox: { offsetX: number; offsetY: number; scaledW: number; scaledH: number };
 } {
-  const planarData = new Float32Array(3 * targetSize * targetSize);
-  const scale = Math.min(targetSize / srcW, targetSize / srcH);
-  const scaledW = Math.max(1, Math.min(targetSize, Math.round(srcW * scale)));
-  const scaledH = Math.max(1, Math.min(targetSize, Math.round(srcH * scale)));
-  const offsetX = Math.floor((targetSize - scaledW) / 2);
-  const offsetY = Math.floor((targetSize - scaledH) / 2);
+  let modelW: number;
+  let modelH: number;
 
+  if (typeof targetSize === 'object' && targetSize !== null) {
+    const tw = targetSize.targetW || 392;
+    modelW = Math.max(14, Math.round(tw / 14) * 14);
+    const th = targetSize.targetH || (modelW * (srcH / srcW));
+    modelH = Math.max(14, Math.round(th / 14) * 14);
+  } else {
+    const size = typeof targetSize === 'number' ? targetSize : 392;
+    modelW = Math.max(14, Math.round(size / 14) * 14);
+    modelH = Math.max(14, Math.round((modelW * (srcH / srcW)) / 14) * 14);
+  }
+
+  const planarData = new Float32Array(3 * modelH * modelW);
   const rOffset = 0;
-  const gOffset = targetSize * targetSize;
-  const bOffset = 2 * targetSize * targetSize;
+  const gOffset = modelH * modelW;
+  const bOffset = 2 * modelH * modelW;
 
   const meanR = 0.485;
   const meanG = 0.456;
@@ -84,17 +94,19 @@ export function preprocessRgbaToPlanarTensor(
   const stdG = 0.224;
   const stdB = 0.225;
 
-  for (let ty = 0; ty < targetSize; ty++) {
-    // Map ty back to src image coordinate with border clamping
-    const syClamped = Math.max(0, Math.min(srcH - 1, (ty - offsetY) * (srcH / scaledH)));
+  const scaleY = srcH / modelH;
+  const scaleX = srcW / modelW;
+
+  for (let ty = 0; ty < modelH; ty++) {
+    const syClamped = Math.max(0, Math.min(srcH - 1, ty * scaleY));
     const sy0 = Math.floor(syClamped);
     const sy1 = Math.min(srcH - 1, sy0 + 1);
     const fy = syClamped - sy0;
 
-    const rowOffset = ty * targetSize;
+    const rowOffset = ty * modelW;
 
-    for (let tx = 0; tx < targetSize; tx++) {
-      const sxClamped = Math.max(0, Math.min(srcW - 1, (tx - offsetX) * (srcW / scaledW)));
+    for (let tx = 0; tx < modelW; tx++) {
+      const sxClamped = Math.max(0, Math.min(srcW - 1, tx * scaleX));
       const sx0 = Math.floor(sxClamped);
       const sx1 = Math.min(srcW - 1, sx0 + 1);
       const fx = sxClamped - sx0;
@@ -104,7 +116,6 @@ export function preprocessRgbaToPlanarTensor(
       const idx10 = (sy1 * srcW + sx0) * 4;
       const idx11 = (sy1 * srcW + sx1) * 4;
 
-      // Bilinear interpolation for R, G, B
       const r = ((rgba[idx00] * (1 - fx) + rgba[idx01] * fx) * (1 - fy) +
                 (rgba[idx10] * (1 - fx) + rgba[idx11] * fx) * fy) / 255.0;
       const g = ((rgba[idx00 + 1] * (1 - fx) + rgba[idx01 + 1] * fx) * (1 - fy) +
@@ -125,12 +136,16 @@ export function preprocessRgbaToPlanarTensor(
     }
   }
 
-  return { planarData, letterbox: { offsetX, offsetY, scaledW, scaledH } };
+  return {
+    planarData,
+    modelW,
+    modelH,
+    letterbox: { offsetX: 0, offsetY: 0, scaledW: modelW, scaledH: modelH },
+  };
 }
 
 /**
- * Normalizes raw model output tensor to [0, 1] and resamples back to target width x height,
- * properly removing letterbox padding.
+ * Resamples depth tensor back to target width x height, optionally un-letterboxing or normalizing.
  */
 export function postprocessDepthTensor(
   tensorData: Float32Array,
@@ -138,23 +153,33 @@ export function postprocessDepthTensor(
   modelH: number,
   targetW: number,
   targetH: number,
-  letterbox?: { offsetX: number; offsetY: number; scaledW: number; scaledH: number; inputSize: number }
+  letterbox?: { offsetX: number; offsetY: number; scaledW: number; scaledH: number; inputSize?: number },
+  normalizeMinMax: boolean = true
 ): Float32Array {
-  // 1. Find min and max
-  let minDepth = Infinity;
-  let maxDepth = -Infinity;
   const total = modelW * modelH;
-  for (let i = 0; i < total; i++) {
-    const val = tensorData[i];
-    if (val < minDepth) minDepth = val;
-    if (val > maxDepth) maxDepth = val;
+  let minDepth = 0;
+  let invRange = 1.0;
+
+  if (normalizeMinMax) {
+    minDepth = Infinity;
+    let maxDepth = -Infinity;
+    for (let i = 0; i < total; i++) {
+      const val = tensorData[i];
+      if (val < minDepth) minDepth = val;
+      if (val > maxDepth) maxDepth = val;
+    }
+    const range = maxDepth - minDepth;
+    invRange = range > 1e-6 ? 1.0 / range : 0;
   }
 
-  const range = maxDepth - minDepth;
-  const invRange = range > 1e-6 ? 1.0 / range : 0;
+  // If dimensions already match target and no letterbox offset
+  const hasLetterbox = letterbox && (letterbox.offsetX !== 0 || letterbox.offsetY !== 0 ||
+    letterbox.scaledW !== modelW || letterbox.scaledH !== modelH);
 
-  // 2. If dimensions already match target and no letterbox, normalize directly
-  if (!letterbox && modelW === targetW && modelH === targetH) {
+  if (!hasLetterbox && modelW === targetW && modelH === targetH) {
+    if (!normalizeMinMax) {
+      return new Float32Array(tensorData);
+    }
     const direct = new Float32Array(total);
     for (let i = 0; i < total; i++) {
       direct[i] = invRange > 0 ? (tensorData[i] - minDepth) * invRange : 0.5;
@@ -162,9 +187,8 @@ export function postprocessDepthTensor(
     return direct;
   }
 
-  // 3. Bilinearly resample to targetW x targetH, un-letterboxing
   const out = new Float32Array(targetW * targetH);
-  const inputSize = letterbox ? letterbox.inputSize : modelW;
+  const inputSize = letterbox ? (letterbox.inputSize ?? modelW) : modelW;
   const scaleXToModel = modelW / inputSize;
   const scaleYToModel = modelH / inputSize;
 
@@ -197,7 +221,11 @@ export function postprocessDepthTensor(
       const val = (d00 * (1 - fx) + d01 * fx) * (1 - fy) +
                   (d10 * (1 - fx) + d11 * fx) * fy;
 
-      out[rowOffset + x] = invRange > 0 ? (val - minDepth) * invRange : 0.5;
+      if (normalizeMinMax) {
+        out[rowOffset + x] = invRange > 0 ? (val - minDepth) * invRange : 0.5;
+      } else {
+        out[rowOffset + x] = val;
+      }
     }
   }
 
@@ -206,13 +234,14 @@ export function postprocessDepthTensor(
 
 /**
  * Initializes the ONNX inference session with WebGPU or WASM fallback.
+ * Uses DepthAnythingV3 exclusively.
  */
 export async function initSession(options: {
   wasmPaths?: Record<string, string> | string;
   modelPath?: string;
   modelPathWebGPU?: string;
   preferWebGPU?: boolean;
-  modelVersion?: 'v3' | 'v2';
+  modelVersion?: 'v3';
 }): Promise<{ session: ort.InferenceSession; backend: 'webgpu' | 'wasm' }> {
   let wasmPaths = options.wasmPaths || '/onnx-wasm/';
   if (typeof wasmPaths === 'string') {
@@ -231,9 +260,7 @@ export async function initSession(options: {
     ort.env.wasm.numThreads = Math.min(4, navigator.hardwareConcurrency || 2);
   }
 
-  const defaultModel = options.modelVersion === 'v2'
-    ? '/models/depthanythingv2.onnx'
-    : '/models/depthanythingv3.onnx';
+  const defaultModel = '/models/depthanythingv3.onnx';
   let modelPath = options.modelPath || defaultModel;
   if (typeof self !== 'undefined' && self.location && !modelPath.startsWith('http://') && !modelPath.startsWith('https://') && !modelPath.startsWith('blob:')) {
     modelPath = new URL(modelPath, self.location.origin + '/').href;
@@ -264,23 +291,10 @@ export async function initSession(options: {
   }
 
   if (!session) {
-    try {
-      session = await ort.InferenceSession.create(modelPath, {
-        executionProviders: ['wasm'],
-      });
-      backend = 'wasm';
-    } catch (wasmErr) {
-      if (modelPath.includes('depthanythingv3.onnx')) {
-        const fallbackPath = modelPath.replace('depthanythingv3.onnx', 'depthanythingv2.onnx');
-        console.warn(`DepthAnythingWorker: Failed to load ${modelPath}, falling back to ${fallbackPath}:`, wasmErr);
-        session = await ort.InferenceSession.create(fallbackPath, {
-          executionProviders: ['wasm'],
-        });
-        backend = 'wasm';
-      } else {
-        throw wasmErr;
-      }
-    }
+    session = await ort.InferenceSession.create(modelPath, {
+      executionProviders: ['wasm'],
+    });
+    backend = 'wasm';
   }
 
   cachedSession = session;
@@ -290,16 +304,16 @@ export async function initSession(options: {
 }
 
 /**
- * Runs inference on raw RGBA Left eye (and optional Right eye) pixels using an active session.
- * Supports both DepthAnythingV3 (rank 5 [1, 2, 3, H, W] for 2-view multi-view stereo or [1, 1, 3, H, W] for mono)
- * and DepthAnythingV2 (rank 4 [1, 3, H, W], 'image', 'depth').
+ * Runs inference on raw RGBA Left eye (and optional Right eye) pixels using DepthAnythingV3.
+ * Supports rank 5 [1, 2, 3, H, W] for 2-view multi-view stereo or [1, 1, 3, H, W] for mono.
+ * Preserves shared multi-view inverse-depth space and extracts camera baseline shift.
  */
 export async function runDepthInference(
   session: ort.InferenceSession,
   rgbaData: Uint8Array,
   width: number,
   height: number,
-  size: number = 504,
+  size: number = 392,
   rightRgbaData?: Uint8Array
 ): Promise<{
   rawDepth: Float32Array;
@@ -307,39 +321,39 @@ export async function runDepthInference(
   conf0?: Float32Array;
   conf1?: Float32Array;
   confidence?: Float32Array;
+  v3BaselinePx?: number;
   numViews: number;
   inferenceTimeMs: number;
 }> {
-  const { planarData: leftPlanar, letterbox } = preprocessRgbaToPlanarTensor(rgbaData, width, height, size, true);
+  const { planarData: leftPlanar, modelW, modelH, letterbox } = preprocessRgbaToPlanarTensor(
+    rgbaData,
+    width,
+    height,
+    size,
+    true
+  );
 
   const inputName = session.inputNames[0] || 'pixel_values';
-  const isV3 = inputName === 'pixel_values';
-
   let inputTensor: ort.Tensor;
   let numViews = 1;
 
-  if (isV3 && rightRgbaData) {
-    // Multi-view stereo forward pass for DepthAnything V3: [1, 2, 3, size, size]
-    const { planarData: rightPlanar } = preprocessRgbaToPlanarTensor(rightRgbaData, width, height, size, true);
-    const stereoPlanar = new Float32Array(2 * 3 * size * size);
+  if (rightRgbaData) {
+    // Multi-view stereo forward pass for DepthAnything V3: [1, 2, 3, modelH, modelW]
+    const { planarData: rightPlanar } = preprocessRgbaToPlanarTensor(
+      rightRgbaData,
+      width,
+      height,
+      size,
+      true
+    );
+    const stereoPlanar = new Float32Array(2 * 3 * modelH * modelW);
     stereoPlanar.set(leftPlanar, 0);
-    stereoPlanar.set(rightPlanar, 3 * size * size);
-    inputTensor = new ort.Tensor('float32', stereoPlanar, [1, 2, 3, size, size]);
-    numViews = 2;
-  } else if (isV3) {
-    inputTensor = new ort.Tensor('float32', leftPlanar, [1, 1, 3, size, size]);
-    numViews = 1;
-  } else if (rightRgbaData) {
-    // Both perspectives for DepthAnything V2: [2, 3, size, size]
-    const { planarData: rightPlanar } = preprocessRgbaToPlanarTensor(rightRgbaData, width, height, size, true);
-    const stereoPlanar = new Float32Array(2 * 3 * size * size);
-    stereoPlanar.set(leftPlanar, 0);
-    stereoPlanar.set(rightPlanar, 3 * size * size);
-    inputTensor = new ort.Tensor('float32', stereoPlanar, [2, 3, size, size]);
+    stereoPlanar.set(rightPlanar, 3 * modelH * modelW);
+    inputTensor = new ort.Tensor('float32', stereoPlanar, [1, 2, 3, modelH, modelW]);
     numViews = 2;
   } else {
-    // Monocular rank 4 [1, 3, H, W] for DepthAnything V2
-    inputTensor = new ort.Tensor('float32', leftPlanar, [1, 3, size, size]);
+    // Single view: [1, 1, 3, modelH, modelW]
+    inputTensor = new ort.Tensor('float32', leftPlanar, [1, 1, 3, modelH, modelW]);
     numViews = 1;
   }
 
@@ -349,59 +363,19 @@ export async function runDepthInference(
     results = await session.run({ [inputName]: inputTensor });
   } catch (err: any) {
     if (numViews === 2) {
-      if (isV3) {
-        console.warn('DepthAnythingWorker: 2-view stereo run failed for V3, falling back to 1-view:', err?.message || err);
-        const singleViewTensor = new ort.Tensor('float32', leftPlanar, [1, 1, 3, size, size]);
-        results = await session.run({ [inputName]: singleViewTensor });
-        numViews = 1;
-      } else {
-        try {
-          console.warn('DepthAnythingWorker: batch 2 failed for V2, running 2 sequential single-view passes:', err?.message || err);
-          const tLeft = new ort.Tensor('float32', leftPlanar, [1, 3, size, size]);
-          const resLeft = await session.run({ [inputName]: tLeft });
-          const outKey = session.outputNames[0] || 'depth';
-          const leftOutTensor = resLeft[outKey];
-          const leftData = leftOutTensor.data as Float32Array;
-
-          const { planarData: rightPlanar } = preprocessRgbaToPlanarTensor(rightRgbaData!, width, height, size, true);
-          const tRight = new ort.Tensor('float32', rightPlanar, [1, 3, size, size]);
-          const resRight = await session.run({ [inputName]: tRight });
-          const rightOutTensor = resRight[outKey];
-          const rightData = rightOutTensor.data as Float32Array;
-
-          const combinedData = new Float32Array(leftData.length + rightData.length);
-          combinedData.set(leftData, 0);
-          combinedData.set(rightData, leftData.length);
-
-          const outDims = [2, ...leftOutTensor.dims.slice(1)];
-          results = {
-            [outKey]: new ort.Tensor('float32', combinedData, outDims),
-          };
-        } catch (seqErr) {
-          console.warn('DepthAnythingWorker: sequential 2-view V2 run failed, falling back to 1-view:', seqErr);
-          const singleViewTensor = new ort.Tensor('float32', leftPlanar, [1, 3, size, size]);
-          results = await session.run({ [inputName]: singleViewTensor });
-          numViews = 1;
-        }
-      }
-    } else if (err && String(err.message).includes('Expected: 5')) {
-      const tensor5D = new ort.Tensor('float32', leftPlanar, [1, 1, 3, size, size]);
-      results = await session.run({ [inputName]: tensor5D });
-    } else if (err && String(err.message).includes('Expected: 4')) {
-      const tensor4D = new ort.Tensor('float32', leftPlanar, [1, 3, size, size]);
-      results = await session.run({ [inputName]: tensor4D });
+      console.warn('DepthAnythingWorker: 2-view stereo run failed, falling back to 1-view:', err?.message || err);
+      const singleViewTensor = new ort.Tensor('float32', leftPlanar, [1, 1, 3, modelH, modelW]);
+      results = await session.run({ [inputName]: singleViewTensor });
+      numViews = 1;
     } else {
       throw err;
     }
   }
   const inferenceTimeMs = performance.now() - t0;
 
-  let outputName = session.outputNames[0] || 'predicted_depth';
-  if (session.outputNames.includes('predicted_depth')) {
-    outputName = 'predicted_depth';
-  } else if (session.outputNames.includes('depth')) {
-    outputName = 'depth';
-  }
+  const outputName = session.outputNames.includes('predicted_depth')
+    ? 'predicted_depth'
+    : (session.outputNames[0] || 'predicted_depth');
 
   const outputTensor = results[outputName];
   if (!outputTensor) {
@@ -409,48 +383,99 @@ export async function runDepthInference(
   }
 
   const dims = outputTensor.dims;
-  const modelH = dims.length >= 2 ? dims[dims.length - 2] : size;
-  const modelW = dims.length >= 2 ? dims[dims.length - 1] : size;
-  const viewElements = modelH * modelW;
+  const outH = dims.length >= 2 ? dims[dims.length - 2] : modelH;
+  const outW = dims.length >= 2 ? dims[dims.length - 1] : modelW;
+  const viewElements = outH * outW;
+  const totalElements = numViews * viewElements;
+  const rawZ = outputTensor.data as Float32Array;
 
-  const tensorData = outputTensor.data as Float32Array;
-  // View 0 is Left Eye [0, viewElements)
-  const leftDepthData = numViews > 1 ? tensorData.subarray(0, viewElements) : tensorData;
+  // Convert positive camera depth Z to inverse depth (disparity space)
+  const jointInvZ = new Float32Array(totalElements);
+  let sumZ = 0;
+  for (let i = 0; i < totalElements; i++) {
+    const z = rawZ[i];
+    sumZ += z;
+    jointInvZ[i] = 1.0 / Math.max(1e-3, z);
+  }
+  const meanZ = sumZ / Math.max(1, totalElements);
 
-  const rawDepth = postprocessDepthTensor(leftDepthData, modelW, modelH, width, height, {
-    ...letterbox,
-    inputSize: size,
-  });
+  // Joint percentile normalization across both views to preserve shared metric disparity space
+  const sorted = Float32Array.from(jointInvZ).sort();
+  const p2 = sorted[Math.floor(sorted.length * 0.02)];
+  const p98 = sorted[Math.floor(sorted.length * 0.98)];
+  const invRange = (p98 - p2) > 1e-6 ? 1.0 / (p98 - p2) : 1.0;
+
+  const normJointInvZ = new Float32Array(totalElements);
+  for (let i = 0; i < totalElements; i++) {
+    normJointInvZ[i] = Math.max(0, Math.min(1, (jointInvZ[i] - p2) * invRange));
+  }
+
+  const rawDepth = postprocessDepthTensor(
+    normJointInvZ.subarray(0, viewElements),
+    outW,
+    outH,
+    width,
+    height,
+    letterbox,
+    false
+  );
 
   let rawRightDepth: Float32Array | undefined;
   if (numViews > 1) {
-    const rightDepthData = tensorData.subarray(viewElements, 2 * viewElements);
-    rawRightDepth = postprocessDepthTensor(rightDepthData, modelW, modelH, width, height, {
-      ...letterbox,
-      inputSize: size,
-    });
+    rawRightDepth = postprocessDepthTensor(
+      normJointInvZ.subarray(viewElements, 2 * viewElements),
+      outW,
+      outH,
+      width,
+      height,
+      letterbox,
+      false
+    );
   }
 
+  // Parse excess confidence weight: c = max(0.01, confVal - 0.99)
   let conf0: Float32Array | undefined;
   let conf1: Float32Array | undefined;
   if (results['confidence']) {
-    const confTensor = results['confidence'];
-    const confData = confTensor.data as Float32Array;
-    const leftConf = numViews > 1 ? confData.subarray(0, viewElements) : confData;
-    conf0 = postprocessDepthTensor(leftConf, modelW, modelH, width, height, {
-      ...letterbox,
-      inputSize: size,
-    });
+    const confData = results['confidence'].data as Float32Array;
+    const c0 = new Float32Array(viewElements);
+    for (let i = 0; i < viewElements; i++) {
+      c0[i] = Math.max(0.01, confData[i] - 0.99);
+    }
+    conf0 = postprocessDepthTensor(c0, outW, outH, width, height, letterbox, false);
+
     if (numViews > 1) {
-      const rightConf = confData.subarray(viewElements, 2 * viewElements);
-      conf1 = postprocessDepthTensor(rightConf, modelW, modelH, width, height, {
-        ...letterbox,
-        inputSize: size,
-      });
+      const c1 = new Float32Array(viewElements);
+      for (let i = 0; i < viewElements; i++) {
+        c1[i] = Math.max(0.01, confData[viewElements + i] - 0.99);
+      }
+      conf1 = postprocessDepthTensor(c1, outW, outH, width, height, letterbox, false);
     }
   }
 
-  return { rawDepth, rawRightDepth, conf0, conf1, confidence: conf0, numViews, inferenceTimeMs };
+  // Parse extrinsics and intrinsics to compute predicted baseline shift in pixels:
+  // v3PredictedBaselinePx = (fx * tx) / meanZ * (width / modelW)
+  let v3BaselinePx: number | undefined;
+  if (results['extrinsics'] && results['intrinsics'] && numViews > 1) {
+    const ext = results['extrinsics'].data as Float32Array;
+    const intr = results['intrinsics'].data as Float32Array;
+    if (ext.length >= 16 && intr.length >= 10) {
+      const tx = Math.abs(ext[15] - ext[3]);
+      const fx = (intr[0] + intr[9]) * 0.5;
+      v3BaselinePx = (fx * tx) / Math.max(1e-3, meanZ) * (width / outW);
+    }
+  }
+
+  return {
+    rawDepth,
+    rawRightDepth,
+    conf0,
+    conf1,
+    confidence: conf0,
+    v3BaselinePx,
+    numViews,
+    inferenceTimeMs,
+  };
 }
 
 // Web Worker message listener (only active in worker execution context)
@@ -474,15 +499,16 @@ if (typeof self !== 'undefined' && typeof (self as any).postMessage === 'functio
         if (!cachedSession || !isInitialized) {
           throw new Error('DepthAnythingWorker not initialized');
         }
-        const inputSize = data.size || 504;
-        const { rawDepth, rawRightDepth, conf0, conf1, confidence, numViews, inferenceTimeMs } = await runDepthInference(
-          cachedSession,
-          data.rgbaData,
-          data.width,
-          data.height,
-          inputSize,
-          data.rightRgbaData
-        );
+        const inputSize = data.size || 392;
+        const { rawDepth, rawRightDepth, conf0, conf1, confidence, v3BaselinePx, numViews, inferenceTimeMs } =
+          await runDepthInference(
+            cachedSession,
+            data.rgbaData,
+            data.width,
+            data.height,
+            inputSize,
+            data.rightRgbaData
+          );
 
         const response: WorkerDepthResultMessage = {
           type: 'depthReady',
@@ -492,6 +518,7 @@ if (typeof self !== 'undefined' && typeof (self as any).postMessage === 'functio
           conf0,
           conf1,
           confidence,
+          v3BaselinePx,
           numViews,
           width: data.width,
           height: data.height,
@@ -499,7 +526,6 @@ if (typeof self !== 'undefined' && typeof (self as any).postMessage === 'functio
           inferenceTimeMs,
         };
 
-        // Transfer rawDepth (and optional buffers) for zero-copy IPC
         const transferables: Transferable[] = [rawDepth.buffer];
         if (rawRightDepth) {
           transferables.push(rawRightDepth.buffer);
@@ -518,5 +544,6 @@ if (typeof self !== 'undefined' && typeof (self as any).postMessage === 'functio
     }
   };
 }
+
 
 
