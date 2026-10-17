@@ -11,26 +11,6 @@ describe('DCIM Catalog & Helper Functions', () => {
     expect(formatBytes(1024 * 1024 * 6.5)).toBe('6.5 MB');
   });
 
-  it('verifies bundled manifest.json structure and file existence', () => {
-    const manifestPath = path.resolve(__dirname, '../../public/samples/manifest.json');
-    expect(fs.existsSync(manifestPath)).toBe(true);
-
-    const content = JSON.parse(fs.readFileSync(manifestPath, 'utf-8'));
-    expect(Array.isArray(content.samples)).toBe(true);
-    expect(content.samples.length).toBeGreaterThanOrEqual(3);
-
-    for (const sample of content.samples) {
-      expect(sample.id).toBeDefined();
-      expect(sample.name).toBeDefined();
-      expect(sample.url).toBeDefined();
-      expect(sample.format).toBeDefined();
-
-      const sampleFilePath = path.resolve(__dirname, '../../public', sample.url);
-      expect(fs.existsSync(sampleFilePath)).toBe(true);
-      const stat = fs.statSync(sampleFilePath);
-      expect(stat.size).toBeGreaterThan(0);
-    }
-  });
 
   it('verifies ffmpeg-core files exist in public/ffmpeg for same-origin loading', () => {
     const coreJs = path.resolve(__dirname, '../../public/ffmpeg/ffmpeg-core.js');

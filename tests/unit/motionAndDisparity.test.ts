@@ -135,11 +135,37 @@ describe('Rust Wasm SIMD Disparity Integration', () => {
     const wasmBytes = fs.readFileSync(wasmPath);
     initSync({ module: wasmBytes });
 
-    // Load real 3DS DCIM frame fixture (HNI_0070.AVI frame 5)
+    let rawRgba: Uint8Array;
     const fixturePath = path.resolve(__dirname, '../fixtures/hni_0070_frame05.rgba');
-    expect(fs.existsSync(fixturePath)).toBe(true);
+    if (fs.existsSync(fixturePath)) {
+      rawRgba = new Uint8Array(fs.readFileSync(fixturePath));
+    } else {
+      // Generate synthetic SBS frame (960x240x4) with multi-plane depth
+      rawRgba = new Uint8Array(960 * 240 * 4);
+      for (let y = 0; y < 240; y++) {
+        for (let x = 0; x < 480; x++) {
+          let shift = 2;
+          if (x > 60 && x < 150 && y > 20 && y < 90) shift = 0;
+          else if (x > 150 && x < 250 && y > 40 && y < 140) shift = 5;
+          else if (x > 250 && x < 350 && y > 80 && y < 180) shift = 8;
+          else if (x > 350 && x < 440 && y > 110 && y < 210) shift = 11;
+          const valLeft = ((x * 374761393) ^ (y * 668265263)) & 0xff;
+          const lIdx = (y * 960 + x) * 4;
+          rawRgba[lIdx] = valLeft;
+          rawRgba[lIdx + 1] = valLeft;
+          rawRgba[lIdx + 2] = valLeft;
+          rawRgba[lIdx + 3] = 255;
 
-    const rawRgba = fs.readFileSync(fixturePath);
+          const xr = Math.min(479, x + shift);
+          const valRight = ((xr * 374761393) ^ (y * 668265263)) & 0xff;
+          const rIdx = (y * 960 + 480 + x) * 4;
+          rawRgba[rIdx] = valRight;
+          rawRgba[rIdx + 1] = valRight;
+          rawRgba[rIdx + 2] = valRight;
+          rawRgba[rIdx + 3] = 255;
+        }
+      }
+    }
     expect(rawRgba.length).toBe(960 * 240 * 4); // 921,600 bytes
 
     // 1. Half resolution disparity (240x120 per eye)

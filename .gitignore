@@ -3,5 +3,7 @@ dist/
 target/
 playwright-report/
 test-results/
+public/samples/
+tests/fixtures/
 .DS_Store
 *.log
