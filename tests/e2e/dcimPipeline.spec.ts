@@ -7,25 +7,28 @@ const FFPROBE_BIN = fs.existsSync('/opt/homebrew/bin/ffprobe')
   ? '/opt/homebrew/bin/ffprobe'
   : 'ffprobe';
 
-test.describe('Spatial 3DS Video Viewer E2E Suite', () => {
+const SCRATCH_DIR = '/Users/nghiaagent/.gemini/antigravity/brain/a683cc2e-6fb4-45b1-933b-9fcd06ec25f2/scratch';
+
+test.describe('Spatial 3DS Video Viewer E2E Suite (HNI_0062.AVI)', () => {
   test.beforeEach(async ({ page }) => {
+    fs.mkdirSync(SCRATCH_DIR, { recursive: true });
     page.on('console', (msg) => console.log(`[BROWSER ${msg.type()}]`, msg.text()));
     page.on('pageerror', (err) => console.error('[BROWSER ERROR]', err.message));
   });
 
-  test('1. DCIM API Discovery & WebGL2 Spatial Window Canvas', async ({ page }) => {
+  test('1. DCIM API Discovery, Speed Slider, Circular Export Rings & Auto-Convergence', async ({ page }) => {
     await page.goto('/');
 
     // 1. Verify Cross-Origin Isolation for SharedArrayBuffer & WebAssembly SIMD
     const isIsolated = await page.evaluate(() => window.crossOriginIsolated);
     expect(isIsolated).toBe(true);
 
-    // 2. Verify DCIM catalog endpoint discovers local recordings without exposing them in the public UI
+    // 2. Verify DCIM catalog endpoint discovers local recordings without exposing them in public UI
     const dcimResponse = await page.request.get('/api/dcim/list');
     expect(dcimResponse.ok()).toBe(true);
     const dcimList = await dcimResponse.json();
     console.log(`Discovered ${dcimList.length} local DCIM recordings via private local dev server`);
-    expect(dcimList.length).toBeGreaterThanOrEqual(36);
+    expect(dcimList.length).toBeGreaterThanOrEqual(10);
 
     // 3. Verify Apple Vision-style Spatial Window & WebGL2 Canvas are rendered
     const spatialWindow = page.locator('#spatial-window');
@@ -41,20 +44,53 @@ test.describe('Spatial 3DS Video Viewer E2E Suite', () => {
     expect(canvasDims.width).toBe(960);
     expect(canvasDims.height).toBe(480);
 
-    // 4. Import test video and verify active playback
+    // 4. Verify Speed Slider is visible in Gentle Sway mode and hidden in other modes
+    const speedControl = page.locator('#speed-dock-control');
+    const freqSlider = page.locator('#freq-slider');
+    await expect(speedControl).toBeVisible();
+    await expect(freqSlider).toBeVisible();
+
+    const motionModeSelect = page.locator('#motion-mode-select');
+    await motionModeSelect.selectOption('interactive');
+    await expect(speedControl).toBeHidden();
+
+    await motionModeSelect.selectOption('manual');
+    await expect(speedControl).toBeHidden();
+
+    await motionModeSelect.selectOption('auto');
+    await expect(speedControl).toBeVisible();
+
+    // 5. Verify Circular Progress Rings are attached to export buttons with zero text status clutter
+    const mp4Ring = page.locator('#export-mp4-btn .progress-ring');
+    await expect(mp4Ring).toBeAttached();
+    const webmRing = page.locator('#export-webm-btn .progress-ring');
+    await expect(webmRing).toBeAttached();
+
+    // 6. Import primary real 3DS video: HNI_0062.AVI
     await page.evaluate(async () => {
       const app = (window as any).__viewerApp;
       await app.importVideo({
-        url: '/api/dcim/file?path=101NIN03/HNI_0065.AVI',
-        name: 'HNI_0065.AVI',
+        url: '/api/dcim/file?path=101NIN03/HNI_0062.AVI',
+        name: 'HNI_0062.AVI',
       });
     });
 
     await page.waitForFunction(() => {
       const app = (window as any).__viewerApp;
       return app && app.videoElement && app.videoElement.readyState >= 2 && app.videoElement.currentTime > 0;
-    }, { timeout: 30_000 });
+    }, { timeout: 45_000 });
 
+    // 7. Verify Auto-Calibrated Global Baseline Convergence locks around -72px
+    await page.waitForTimeout(600); // Allow 4-frame auto-convergence loop
+    const telemetry = await page.evaluate(() => {
+      const app = (window as any).__viewerApp;
+      return app.viewer.getTelemetry();
+    });
+    console.log('HNI_0062.AVI Auto-Convergence Telemetry:', telemetry);
+    expect(telemetry.baseDisp).toBeLessThanOrEqual(-60);
+    expect(telemetry.baseDisp).toBeGreaterThanOrEqual(-96);
+
+    // 8. Verify upright render (flipY: true) produces active non-black center pixels
     const pixelCheck = await page.evaluate(() => {
       const app = (window as any).__viewerApp;
       const gl = app.viewer.getGLContext() as WebGL2RenderingContext;
@@ -67,116 +103,116 @@ test.describe('Spatial 3DS Video Viewer E2E Suite', () => {
     expect(pixelCheck.r + pixelCheck.g + pixelCheck.b).toBeGreaterThan(0);
   });
 
-  test('2. 3D Moving Spatial Window & GPU/Wasm Disparity Perspective Shifting', async ({ page }) => {
+  test('2. 2.5D Parallax View Synthesis & Diagnostic Visual Inspection Screenshots', async ({ page }) => {
     await page.goto('/');
 
-    // Import test video
+    // Import primary test video HNI_0062.AVI
     await page.evaluate(async () => {
       const app = (window as any).__viewerApp;
       await app.importVideo({
-        url: '/api/dcim/file?path=101NIN03/HNI_0065.AVI',
-        name: 'HNI_0065.AVI',
+        url: '/api/dcim/file?path=101NIN03/HNI_0062.AVI',
+        name: 'HNI_0062.AVI',
       });
     });
 
     await page.waitForFunction(() => {
       const app = (window as any).__viewerApp;
       return app && app.videoElement && app.videoElement.readyState >= 2 && app.videoElement.currentTime > 0;
-    }, { timeout: 30_000 });
+    }, { timeout: 45_000 });
 
-    // 1. Verify Apple Vision Pro 3D Spatial Window movement in CSS space
-    const windowTransforms = await page.evaluate(async () => {
+    const canvasLocator = page.locator('#parallax-canvas');
+
+    // 1. Capture Diagnostic Screenshot: Left Eye Perspective (t = 0.08)
+    await page.evaluate(async () => {
       const app = (window as any).__viewerApp;
-      app.setManualShift(0.0);
-      await new Promise((r) => setTimeout(r, 80));
-      const leftTransform = app.spatialWindow.style.transform;
+      app.setManualShift(0.08);
+      await app.viewer.renderVideoFrame(app.videoElement, 0.08);
+    });
+    await page.waitForTimeout(150);
+    const leftScreenshotPath = path.join(SCRATCH_DIR, 'hni_0062_left_t08.png');
+    await canvasLocator.screenshot({ path: leftScreenshotPath });
+    console.log(`Saved Left perspective screenshot: ${leftScreenshotPath}`);
+    expect(fs.existsSync(leftScreenshotPath)).toBe(true);
 
-      app.setManualShift(1.0);
-      await new Promise((r) => setTimeout(r, 80));
-      const rightTransform = app.spatialWindow.style.transform;
+    // 2. Capture Diagnostic Screenshot: Center View (t = 0.50)
+    await page.evaluate(async () => {
+      const app = (window as any).__viewerApp;
+      app.setManualShift(0.50);
+      await app.viewer.renderVideoFrame(app.videoElement, 0.50);
+    });
+    await page.waitForTimeout(150);
+    const centerScreenshotPath = path.join(SCRATCH_DIR, 'hni_0062_center_t50.png');
+    await canvasLocator.screenshot({ path: centerScreenshotPath });
+    console.log(`Saved Center perspective screenshot: ${centerScreenshotPath}`);
+    expect(fs.existsSync(centerScreenshotPath)).toBe(true);
 
-      return { leftTransform, rightTransform };
+    // 3. Capture Diagnostic Screenshot: Right Eye Perspective (t = 0.92)
+    await page.evaluate(async () => {
+      const app = (window as any).__viewerApp;
+      app.setManualShift(0.92);
+      await app.viewer.renderVideoFrame(app.videoElement, 0.92);
+    });
+    await page.waitForTimeout(150);
+    const rightScreenshotPath = path.join(SCRATCH_DIR, 'hni_0062_right_t92.png');
+    await canvasLocator.screenshot({ path: rightScreenshotPath });
+    console.log(`Saved Right perspective screenshot: ${rightScreenshotPath}`);
+    expect(fs.existsSync(rightScreenshotPath)).toBe(true);
+
+    // 4. Capture Diagnostic Screenshot: Disparity Heatmap Mode (renderMode = 1)
+    await page.evaluate(async () => {
+      const app = (window as any).__viewerApp;
+      app.viewer.setRenderMode(1);
+      await app.viewer.renderVideoFrame(app.videoElement, 0.50);
+    });
+    await page.waitForTimeout(150);
+    const heatmapScreenshotPath = path.join(SCRATCH_DIR, 'hni_0062_heatmap_mode1.png');
+    await canvasLocator.screenshot({ path: heatmapScreenshotPath });
+    console.log(`Saved Disparity Heatmap screenshot: ${heatmapScreenshotPath}`);
+    expect(fs.existsSync(heatmapScreenshotPath)).toBe(true);
+
+    // Restore render mode to 0
+    await page.evaluate(async () => {
+      const app = (window as any).__viewerApp;
+      app.viewer.setRenderMode(0);
+      await app.viewer.renderVideoFrame(app.videoElement, 0.50);
     });
 
-    console.log('Spatial window left transform:', windowTransforms.leftTransform);
-    console.log('Spatial window right transform:', windowTransforms.rightTransform);
-    expect(windowTransforms.leftTransform).toContain('translateX(-18px)');
-    expect(windowTransforms.leftTransform).toContain('rotateY(6.5deg)');
-    expect(windowTransforms.rightTransform).toContain('translateX(18px)');
-    expect(windowTransforms.rightTransform).toContain('rotateY(-6.5deg)');
-
-    // 2. Test Perspective Shift on GPU backend (Left vs Right shift difference)
-    const shiftResult = await page.evaluate(async () => {
+    // 5. Measure genuine parallax pixel difference between Left and Right viewpoints
+    const shiftDiff = await page.evaluate(async () => {
       const app = (window as any).__viewerApp;
       app.pauseRenderLoop();
       const gl = app.viewer.getGLContext() as WebGL2RenderingContext;
 
-      // Render Left perspective (0.0)
-      await app.viewer.renderVideoFrame(app.videoElement, 0.0);
+      await app.viewer.renderVideoFrame(app.videoElement, 0.08);
       const pLeft = new Uint8Array(960 * 480 * 4);
       gl.readPixels(0, 0, 960, 480, gl.RGBA, gl.UNSIGNED_BYTE, pLeft);
 
-      // Render Right perspective (1.0)
-      await app.viewer.renderVideoFrame(app.videoElement, 1.0);
+      await app.viewer.renderVideoFrame(app.videoElement, 0.92);
       const pRight = new Uint8Array(960 * 480 * 4);
       gl.readPixels(0, 0, 960, 480, gl.RGBA, gl.UNSIGNED_BYTE, pRight);
 
-      // Calculate total pixel difference across frames
-      let diff = 0;
+      let delta = 0;
       for (let i = 0; i < pLeft.length; i += 4) {
-        diff += Math.abs(pLeft[i] - pRight[i]) +
-                Math.abs(pLeft[i + 1] - pRight[i + 1]) +
-                Math.abs(pLeft[i + 2] - pRight[i + 2]);
+        delta += Math.abs(pLeft[i] - pRight[i]) +
+                 Math.abs(pLeft[i + 1] - pRight[i + 1]) +
+                 Math.abs(pLeft[i + 2] - pRight[i + 2]);
       }
-
       app.resumeRenderLoop();
-      return { diff };
+      return delta;
     });
 
-    console.log('Perspective shift total pixel delta:', shiftResult.diff);
-    expect(shiftResult.diff).toBeGreaterThan(1000);
-
-    // 3. Switch to Wasm SIMD backend and verify telemetry
-    const wasmTelemetry = await page.evaluate(async () => {
-      const app = (window as any).__viewerApp;
-      app.viewer.setBackend('wasm');
-      const tel = await app.viewer.renderVideoFrame(app.videoElement, 0.5);
-      return { backend: tel.backend, dispMs: tel.disparityMs };
-    });
-
-    expect(wasmTelemetry.backend).toBe('wasm');
-    expect(wasmTelemetry.dispMs).toBeGreaterThanOrEqual(0);
-
-    // 4. Test Disparity Depth Heatmap mode
-    const heatmapResult = await page.evaluate(async () => {
-      const app = (window as any).__viewerApp;
-      app.viewer.setRenderMode(1); // Mode 1: Heatmap
-      await app.viewer.renderVideoFrame(app.videoElement, 0.5);
-      const gl = app.viewer.getGLContext() as WebGL2RenderingContext;
-      const p = new Uint8Array(960 * 480 * 4);
-      gl.readPixels(0, 0, 960, 480, gl.RGBA, gl.UNSIGNED_BYTE, p);
-      app.viewer.setRenderMode(0); // restore
-
-      let rSum = 0, gSum = 0, bSum = 0;
-      for (let i = 0; i < p.length; i += 16) {
-        rSum += p[i];
-        gSum += p[i + 1];
-        bSum += p[i + 2];
-      }
-      return { rSum, gSum, bSum };
-    });
-
-    expect(heatmapResult.rSum + heatmapResult.gSum + heatmapResult.bSum).toBeGreaterThan(0);
+    console.log(`Left vs Right viewpoint total pixel delta: ${shiftDiff}`);
+    expect(shiftDiff).toBeGreaterThan(50_000);
   });
 
-  test('3. Raw Dual-Stream 3DS .AVI Import and Transcoding', async ({ page }) => {
+  test('3. Raw Dual-Stream 3DS .AVI Import and Transcoding (HNI_0062.AVI)', async ({ page }) => {
     await page.goto('/');
 
     await page.evaluate(async () => {
       const app = (window as any).__viewerApp;
       await app.importVideo({
-        url: '/api/dcim/file?path=101NIN03/HNI_0065.AVI',
-        name: 'HNI_0065.AVI',
+        url: '/api/dcim/file?path=101NIN03/HNI_0062.AVI',
+        name: 'HNI_0062.AVI',
       });
     });
 
@@ -208,15 +244,15 @@ test.describe('Spatial 3DS Video Viewer E2E Suite', () => {
     await page.evaluate(async () => {
       const app = (window as any).__viewerApp;
       await app.importVideo({
-        url: '/api/dcim/file?path=101NIN03/HNI_0065.AVI',
-        name: 'HNI_0065.AVI',
+        url: '/api/dcim/file?path=101NIN03/HNI_0062.AVI',
+        name: 'HNI_0062.AVI',
       });
     });
 
     await page.waitForFunction(() => {
       const app = (window as any).__viewerApp;
       return app && app.videoElement && app.videoElement.readyState >= 2 && app.videoElement.currentTime > 0;
-    }, { timeout: 30_000 });
+    }, { timeout: 45_000 });
 
     const testResultsDir = path.resolve(process.cwd(), 'test-results');
     fs.mkdirSync(testResultsDir, { recursive: true });

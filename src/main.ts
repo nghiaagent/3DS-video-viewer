@@ -437,3 +437,13 @@ requestAnimationFrame(renderLoop);
     }
   },
 };
+
+// Auto-load DCIM video via query param on localhost e.g. ?dcim=101NIN03/HNI_0062.AVI
+if (typeof window !== 'undefined') {
+  const urlParams = new URLSearchParams(window.location.search);
+  const dcimParam = urlParams.get('dcim');
+  if (dcimParam && (window.location.hostname === 'localhost' || window.location.hostname === '127.0.0.1')) {
+    const filename = dcimParam.split('/').pop() || 'HNI_0062.AVI';
+    loadVideo({ url: `/api/dcim/file?path=${encodeURIComponent(dcimParam)}`, name: filename });
+  }
+}
