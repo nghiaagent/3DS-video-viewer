@@ -59,6 +59,8 @@ export class WebGLParallaxViewer {
   private dispLocs: {
     sbsTexture: WebGLUniformLocation | null;
     prevDispTexture: WebGLUniformLocation | null;
+    daDepthTexture: WebGLUniformLocation | null;
+    hasDaDepth: WebGLUniformLocation | null;
     eyeTexelSize: WebGLUniformLocation | null;
     maxDisp: WebGLUniformLocation | null;
     baseDisp: WebGLUniformLocation | null;
@@ -67,6 +69,8 @@ export class WebGLParallaxViewer {
   } = {
     sbsTexture: null,
     prevDispTexture: null,
+    daDepthTexture: null,
+    hasDaDepth: null,
     eyeTexelSize: null,
     maxDisp: null,
     baseDisp: null,
@@ -79,11 +83,15 @@ export class WebGLParallaxViewer {
   private depthFilterLocs: {
     rawDispTexture: WebGLUniformLocation | null;
     sbsTexture: WebGLUniformLocation | null;
+    daDepthTexture: WebGLUniformLocation | null;
+    hasDaDepth: WebGLUniformLocation | null;
     dispTexelSize: WebGLUniformLocation | null;
     windowCrop: WebGLUniformLocation | null;
   } = {
     rawDispTexture: null,
     sbsTexture: null,
+    daDepthTexture: null,
+    hasDaDepth: null,
     dispTexelSize: null,
     windowCrop: null,
   };
@@ -164,6 +172,10 @@ export class WebGLParallaxViewer {
   private filteredDispFbo: WebGLFramebuffer | null = null;
   private tempFilterTexture: WebGLTexture | null = null;
   private tempFilterFbo: WebGLFramebuffer | null = null;
+
+  // External DepthAnything depth map texture and state
+  private daDepthTexture: WebGLTexture | null = null;
+  private hasDaDepth: boolean = false;
 
   // Configurations
   private backend: DisparityBackend = 'gpu';
@@ -276,6 +288,8 @@ export class WebGLParallaxViewer {
     this.dispLocs = {
       sbsTexture: gl.getUniformLocation(this.disparityProgram, 'u_sbsTexture'),
       prevDispTexture: gl.getUniformLocation(this.disparityProgram, 'u_prevDispTexture'),
+      daDepthTexture: gl.getUniformLocation(this.disparityProgram, 'u_daDepthTexture'),
+      hasDaDepth: gl.getUniformLocation(this.disparityProgram, 'u_hasDaDepth'),
       eyeTexelSize: gl.getUniformLocation(this.disparityProgram, 'u_eyeTexelSize'),
       maxDisp: gl.getUniformLocation(this.disparityProgram, 'u_maxDisp'),
       baseDisp: gl.getUniformLocation(this.disparityProgram, 'u_baseDisp'),
@@ -288,6 +302,8 @@ export class WebGLParallaxViewer {
     this.depthFilterLocs = {
       rawDispTexture: gl.getUniformLocation(this.depthFilterProgram, 'u_rawDispTexture'),
       sbsTexture: gl.getUniformLocation(this.depthFilterProgram, 'u_sbsTexture'),
+      daDepthTexture: gl.getUniformLocation(this.depthFilterProgram, 'u_daDepthTexture'),
+      hasDaDepth: gl.getUniformLocation(this.depthFilterProgram, 'u_hasDaDepth'),
       dispTexelSize: gl.getUniformLocation(this.depthFilterProgram, 'u_dispTexelSize'),
       windowCrop: gl.getUniformLocation(this.depthFilterProgram, 'u_windowCrop'),
     };
@@ -335,6 +351,25 @@ export class WebGLParallaxViewer {
     gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.LINEAR);
     gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_S, gl.CLAMP_TO_EDGE);
     gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE);
+
+    // DepthAnything external depth texture setup (gl.R8 with fallback, LINEAR filtering)
+    this.daDepthTexture = gl.createTexture();
+    gl.bindTexture(gl.TEXTURE_2D, this.daDepthTexture);
+    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.LINEAR);
+    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.LINEAR);
+    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_S, gl.CLAMP_TO_EDGE);
+    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE);
+    gl.pixelStorei(gl.UNPACK_ALIGNMENT, 1);
+    const initialDepth = new Uint8Array([128]);
+    try {
+      gl.texImage2D(gl.TEXTURE_2D, 0, gl.R8, 1, 1, 0, gl.RED, gl.UNSIGNED_BYTE, initialDepth);
+    } catch {
+      try {
+        gl.texImage2D(gl.TEXTURE_2D, 0, gl.LUMINANCE, 1, 1, 0, gl.LUMINANCE, gl.UNSIGNED_BYTE, initialDepth);
+      } catch {
+        gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA, 1, 1, 0, gl.RGBA, gl.UNSIGNED_BYTE, new Uint8Array([128, 128, 128, 255]));
+      }
+    }
 
     this.allocateDisparityFbos(this.eyeWidth, this.eyeHeight);
   }
@@ -625,6 +660,83 @@ export class WebGLParallaxViewer {
 
   public getLastFrameTimestamp(): number {
     return this.lastFrameTimestamp;
+  }
+
+  /**
+   * Upload an external depth map (e.g. from DepthAnythingV2) to the GPU.
+   * Format: Uint8Array of length (width * height), values 0..255.
+   */
+  public uploadExternalDepthMap(depthData: Uint8Array, width: number, height: number): void {
+    const gl = this.gl;
+    if (!this.daDepthTexture) {
+      this.daDepthTexture = gl.createTexture();
+    }
+    gl.bindTexture(gl.TEXTURE_2D, this.daDepthTexture);
+    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.LINEAR);
+    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.LINEAR);
+    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_S, gl.CLAMP_TO_EDGE);
+    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE);
+    gl.pixelStorei(gl.UNPACK_ALIGNMENT, 1);
+    gl.pixelStorei(gl.UNPACK_FLIP_Y_WEBGL, false);
+
+    try {
+      gl.texImage2D(
+        gl.TEXTURE_2D,
+        0,
+        gl.R8,
+        width,
+        height,
+        0,
+        gl.RED,
+        gl.UNSIGNED_BYTE,
+        depthData
+      );
+    } catch {
+      try {
+        gl.texImage2D(
+          gl.TEXTURE_2D,
+          0,
+          gl.LUMINANCE,
+          width,
+          height,
+          0,
+          gl.LUMINANCE,
+          gl.UNSIGNED_BYTE,
+          depthData
+        );
+      } catch {
+        const rgba = new Uint8Array(width * height * 4);
+        for (let i = 0; i < depthData.length; i++) {
+          const v = depthData[i];
+          const idx = i * 4;
+          rgba[idx] = v;
+          rgba[idx + 1] = v;
+          rgba[idx + 2] = v;
+          rgba[idx + 3] = 255;
+        }
+        gl.texImage2D(
+          gl.TEXTURE_2D,
+          0,
+          gl.RGBA,
+          width,
+          height,
+          0,
+          gl.RGBA,
+          gl.UNSIGNED_BYTE,
+          rgba
+        );
+      }
+    }
+
+    this.hasDaDepth = true;
+  }
+
+  public hasExternalDepthMap(): boolean {
+    return this.hasDaDepth;
+  }
+
+  public clearExternalDepthMap(): void {
+    this.hasDaDepth = false;
   }
 
   /**
@@ -942,6 +1054,11 @@ export class WebGLParallaxViewer {
     gl.bindTexture(gl.TEXTURE_2D, this.dispTextures[readIdx]);
     gl.uniform1i(this.dispLocs.prevDispTexture, 1);
 
+    gl.activeTexture(gl.TEXTURE2);
+    gl.bindTexture(gl.TEXTURE_2D, this.daDepthTexture);
+    gl.uniform1i(this.dispLocs.daDepthTexture, 2);
+    gl.uniform1f(this.dispLocs.hasDaDepth, this.hasDaDepth ? 1.0 : 0.0);
+
     gl.uniform2f(this.dispLocs.eyeTexelSize, 1.0 / this.eyeWidth, 1.0 / this.eyeHeight);
     gl.uniform1i(this.dispLocs.maxDisp, 16);
     gl.uniform1i(this.dispLocs.baseDisp, this.baseDisp);
@@ -979,6 +1096,11 @@ export class WebGLParallaxViewer {
     gl.bindTexture(gl.TEXTURE_2D, this.sbsTexture);
     gl.uniform1i(this.depthFilterLocs.sbsTexture, 1);
 
+    gl.activeTexture(gl.TEXTURE2);
+    gl.bindTexture(gl.TEXTURE_2D, this.daDepthTexture);
+    gl.uniform1i(this.depthFilterLocs.daDepthTexture, 2);
+    gl.uniform1f(this.depthFilterLocs.hasDaDepth, this.hasDaDepth ? 1.0 : 0.0);
+
     gl.drawArrays(gl.TRIANGLES, 0, 3);
 
     // Pass 2B: tempFilterTexture -> filteredDispFbo
@@ -992,6 +1114,11 @@ export class WebGLParallaxViewer {
     gl.activeTexture(gl.TEXTURE1);
     gl.bindTexture(gl.TEXTURE_2D, this.sbsTexture);
     gl.uniform1i(this.depthFilterLocs.sbsTexture, 1);
+
+    gl.activeTexture(gl.TEXTURE2);
+    gl.bindTexture(gl.TEXTURE_2D, this.daDepthTexture);
+    gl.uniform1i(this.depthFilterLocs.daDepthTexture, 2);
+    gl.uniform1f(this.depthFilterLocs.hasDaDepth, this.hasDaDepth ? 1.0 : 0.0);
 
     gl.drawArrays(gl.TRIANGLES, 0, 3);
 
@@ -1110,6 +1237,7 @@ export class WebGLParallaxViewer {
     if (this.perspectiveProgram) gl.deleteProgram(this.perspectiveProgram);
     if (this.tieflingMeshProgram) gl.deleteProgram(this.tieflingMeshProgram);
     if (this.sbsTexture) gl.deleteTexture(this.sbsTexture);
+    if (this.daDepthTexture) gl.deleteTexture(this.daDepthTexture);
     for (let i = 0; i < 2; i++) {
       if (this.dispTextures[i]) gl.deleteTexture(this.dispTextures[i]);
       if (this.disparityFbos[i]) gl.deleteFramebuffer(this.disparityFbos[i]);

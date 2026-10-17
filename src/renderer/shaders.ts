@@ -25,6 +25,8 @@ out vec4 outColor;
 
 uniform sampler2D u_rawDispTexture;
 uniform sampler2D u_sbsTexture;
+uniform sampler2D u_daDepthTexture;
+uniform float u_hasDaDepth;
 uniform vec2 u_dispTexelSize;
 uniform float u_windowCrop;
 
@@ -32,9 +34,15 @@ void main() {
     // Center reference samples
     float dCenter = texture(u_rawDispTexture, v_uv).r;
     vec3 centerColor = texture(u_sbsTexture, vec2(v_uv.x * 0.5, v_uv.y)).rgb;
+    float daCenter = (u_hasDaDepth > 0.5) ? texture(u_daDepthTexture, v_uv).r : dCenter;
 
     float sumWeights = 0.0;
     float sumFilteredD = 0.0;
+
+    // Continuous branchless Gaussian spatial weight: sigmaSpatial = 2.8 -> 2 * sigma^2 = 15.68
+    const float twoSigmaSpatialSq = 15.68;
+    // Joint guided filter / color-prior smoothness: sigma_c = 0.20 -> 2 * sigma_c^2 = 0.08
+    const float twoSigmaColorSq = 0.08;
 
     for (int dy = -4; dy <= 4; dy++) {
         for (int dx = -4; dx <= 4; dx++) {
@@ -46,13 +54,21 @@ void main() {
             vec3 colorDiff = sampleColor - centerColor;
             float colorDistSq = dot(colorDiff, colorDiff);
 
-            // Smooth isotropic Gaussian spatial weight (sigma = 2.5 -> 2*sigma^2 = 12.5)
-            // + gentle color guidance (sigma_c = 0.25 -> 2*sigma_c^2 = 0.125)
-            // + smooth Tiefling foreground dilation bias: exp((sampleD - dCenter) * 1.8) softly favors foreground without any diamond steps!
-            float wSpatial = exp(-spatialDistSq / 12.5);
-            float wColor = exp(-colorDistSq / 0.125);
+            // Smooth isotropic Gaussian spatial weight (sigmaSpatial = 2.8)
+            float wSpatial = exp(-spatialDistSq / twoSigmaSpatialSq);
+            // Joint Guided Filter / Color-Prior Smoothness term
+            float wColor = exp(-colorDistSq / twoSigmaColorSq);
+            // Continuous branchless soft foreground dilation weight without diamond steps: exp((sampleD - dCenter) * 1.8)
             float wForeground = exp((sampleD - dCenter) * 1.8);
-            float weight = wSpatial * mix(1.0, wColor, 0.5) * wForeground;
+
+            float weight = wSpatial * wColor * wForeground;
+
+            if (u_hasDaDepth > 0.5) {
+                float sampleDa = texture(u_daDepthTexture, offsetUV).r;
+                float daDiff = abs(sampleDa - daCenter);
+                float wDa = exp(-daDiff * 10.0);
+                weight *= wDa;
+            }
 
             sumFilteredD += sampleD * weight;
             sumWeights += weight;
@@ -60,6 +76,9 @@ void main() {
     }
 
     float outDepth = sumFilteredD / max(1e-4, sumWeights);
+    if (u_hasDaDepth > 0.5) {
+        outDepth = mix(outDepth, daCenter, 0.25);
+    }
     outColor = vec4(outDepth, 0.0, 0.0, 1.0);
 }
 `;
@@ -136,6 +155,8 @@ out vec4 outColor;
 
 uniform sampler2D u_sbsTexture;
 uniform sampler2D u_prevDispTexture;
+uniform sampler2D u_daDepthTexture;
+uniform float u_hasDaDepth;
 uniform vec2 u_eyeTexelSize;     // Full-res eye texel size e.g. vec2(1.0 / 480.0, 1.0 / 240.0)
 uniform int u_maxDisp;           // Search radius e.g. 16
 uniform int u_baseDisp;          // Convergence baseline offset e.g. 8 (range [-80, 24])
@@ -191,13 +212,28 @@ void main() {
 
     const int MAX_CANDIDATES = 65;
     float costs[MAX_CANDIDATES];
+    for (int i = 0; i < MAX_CANDIDATES; ++i) {
+        costs[i] = 1e6;
+    }
+
+    float daD = 0.5;
+    int predD = u_baseDisp;
+    int searchMin = startD;
+    int searchMax = endD;
+
+    if (u_hasDaDepth > 0.5) {
+        daD = texture(u_daDepthTexture, v_uv).r;
+        predD = startD + int(round(daD * float(endD - startD)));
+        searchMin = max(startD, predD - 4);
+        searchMax = min(endD, predD + 4);
+    }
 
     float bestSAD = 1e6;
-    int bestD = u_baseDisp;
+    int bestD = (u_hasDaDepth > 0.5) ? predD : u_baseDisp;
 
-    for (int d = startD; d <= endD; ++d) {
+    for (int d = searchMin; d <= searchMax; ++d) {
         int candIdx = d - startD;
-        if (candIdx >= MAX_CANDIDATES) break;
+        if (candIdx < 0 || candIdx >= MAX_CANDIDATES) continue;
 
         float rightCenterLuma = getLuma(texture(u_sbsTexture, vec2(0.5 + clamp((uv.x - float(d) * u_eyeTexelSize.x) * 0.5, 0.002, 0.498), uv.y)).rgb);
 
@@ -237,8 +273,12 @@ void main() {
             }
         }
 
-        // Quadratic smoothness prior toward u_baseDisp to penalize extreme deviations on flat regions
-        float priorPenalty = 0.0015 * float((d - u_baseDisp) * (d - u_baseDisp));
+        // Prior regularizer:
+        // When DepthAnything is active, regularize toward predD with strong penalty
+        // When DepthAnything is inactive, use subtle baseline quadratic penalty toward u_baseDisp
+        float priorPenalty = (u_hasDaDepth > 0.5)
+            ? (0.012 * float((d - predD) * (d - predD)))
+            : (0.0015 * float((d - u_baseDisp) * (d - u_baseDisp)));
         cost += priorPenalty;
 
         costs[candIdx] = cost;
@@ -254,7 +294,7 @@ void main() {
     float secondBestSAD = 1e6;
     for (int i = 0; i < MAX_CANDIDATES; ++i) {
         if (i >= numCandidates) break;
-        if (abs(i - bestIdx) > 1) {
+        if (abs(i - bestIdx) > 1 && costs[i] < 1e5) {
             if (costs[i] < secondBestSAD) {
                 secondBestSAD = costs[i];
             }
@@ -265,8 +305,8 @@ void main() {
     }
 
     // Subpixel parabolic interpolation using costMinus (bestD - 1) and costPlus (bestD + 1)
-    float costMinus = (bestIdx > 0) ? costs[bestIdx - 1] : bestSAD;
-    float costPlus = (bestIdx < numCandidates - 1 && bestIdx + 1 < MAX_CANDIDATES) ? costs[bestIdx + 1] : bestSAD;
+    float costMinus = (bestIdx > 0 && costs[bestIdx - 1] < 1e5) ? costs[bestIdx - 1] : bestSAD;
+    float costPlus = (bestIdx < numCandidates - 1 && bestIdx + 1 < MAX_CANDIDATES && costs[bestIdx + 1] < 1e5) ? costs[bestIdx + 1] : bestSAD;
 
     float denom = 2.0 * (costMinus + costPlus - 2.0 * bestSAD);
     float subpixelD = float(bestD) + ((denom > 1e-4) ? clamp((costMinus - costPlus) / denom, -0.5, 0.5) : 0.0);
@@ -279,8 +319,23 @@ void main() {
     float texConf = smoothstep(0.08, 0.35, gradEnergy);
     float conf = clamp(uniqueness * texConf, 0.0, 1.0);
 
-    // Ambiguous or flat regions smoothly revert to 0.5 convergence plane
-    normD = mix(0.5, normD, conf);
+    if (u_hasDaDepth > 0.5) {
+        // SBS photometric warp verification pass
+        float daShiftPx = float(startD) + daD * float(endD - startD);
+        vec3 colL = texture(u_sbsTexture, vec2(uv.x * 0.5, uv.y)).rgb;
+        vec3 colR_da = texture(u_sbsTexture, vec2(0.5 + clamp((uv.x - daShiftPx * u_eyeTexelSize.x) * 0.5, 0.002, 0.498), uv.y)).rgb;
+        float errDA = length(colL - colR_da);
+
+        vec3 colR_best = texture(u_sbsTexture, vec2(0.5 + clamp((uv.x - subpixelD * u_eyeTexelSize.x) * 0.5, 0.002, 0.498), uv.y)).rgb;
+        float errBest = length(colL - colR_best);
+
+        // Only blend in stereo deviation where errBest < errDA - 0.03 (warp verification)
+        float sbsImprovement = smoothstep(0.02, 0.10, errDA - errBest);
+        normD = mix(daD, normD, 0.35 * sbsImprovement);
+    } else {
+        // Ambiguous or flat regions smoothly revert to 0.5 convergence plane
+        normD = mix(0.5, normD, conf);
+    }
 
     // Ping-pong temporal stabilization
     if (u_temporalWeight > 0.01) {
