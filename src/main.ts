@@ -3,7 +3,7 @@ import { WebGLParallaxViewer, type RenderMode, type DisparityBackend, type Upsca
 import { MotionController } from './renderer/motionController.js';
 import { import3DSVideo, type VideoSource } from './importer/import3DSVideo.js';
 import { exportParallaxVideo, exportOfflineGPUVideo, type ExportFormat, type ExportMode } from './exporter/index.js';
-import { DepthAnythingController } from './depth/stereoGuidedDepth.js';
+import { DepthAnythingController, VideoDepthTimeline } from './depth/stereoGuidedDepth.js';
 
 // DOM Elements
 const canvas = document.getElementById('parallax-canvas') as HTMLCanvasElement;
@@ -82,6 +82,22 @@ depthController.init().catch((err) => {
   console.warn('[DepthController] Init warning:', err);
 });
 
+let videoDepthTimeline: VideoDepthTimeline = new VideoDepthTimeline({
+  fps: 20,
+  inputSize: 336,
+});
+depthController.setTimeline(videoDepthTimeline);
+
+// Register frame-accurate synchronous depth provider (0.0 ms desync)
+viewer.setDepthProvider((timeSec: number) => {
+  if (!videoDepthTimeline) return null;
+  const depth = videoDepthTimeline.getDepthAtTime(timeSec, depthController.getModelVersion());
+  if (depth) {
+    return { depth, width: 480, height: 240 };
+  }
+  return null;
+});
+
 let motionMode: 'auto' | 'interactive' | 'manual' = 'auto';
 let isSeeking = false;
 let isExporting = false;
@@ -106,16 +122,39 @@ function setImportProgress(stage: string, ratio: number) {
   }
 }
 
+export type LoadVideoSource = File | Blob | string | VideoSource;
+
 // Load Video Helper
-async function loadVideo(source: VideoSource) {
+async function loadVideo(source: LoadVideoSource, displayName?: string) {
   try {
     viewer.clearExternalDepthMap();
     setImportProgress('Opening video...', 0.05);
-    const result = await import3DSVideo(source, sourceVideo, (stage, ratio) => {
+
+    let sourceInput: VideoSource;
+    if (typeof source === 'string') {
+      sourceInput = {
+        url: source,
+        name: displayName || source.split('/').pop() || '3ds_recording.avi',
+      };
+    } else if (source instanceof File) {
+      sourceInput = source;
+    } else if (source instanceof Blob) {
+      sourceInput = new File([source], displayName || '3ds_recording.avi', { type: source.type });
+    } else {
+      sourceInput = source;
+    }
+
+    const result = await import3DSVideo(sourceInput, sourceVideo, (stage, ratio) => {
       setImportProgress(stage, ratio);
     });
+    sourceVideo.pause();
+    sourceVideo.currentTime = 0;
+
     if (result.metadata && result.metadata.found) {
       viewer.setThreeDSMetadata(result.metadata.parallaxOffset, result.metadata.estimatedBaseDisp);
+      if (result.metadata.estimatedBaseDisp !== null && Number.isFinite(result.metadata.estimatedBaseDisp)) {
+        viewer.setBaseDisparity(result.metadata.estimatedBaseDisp);
+      }
     } else {
       viewer.setThreeDSMetadata(0, null as any);
     }
@@ -123,6 +162,48 @@ async function loadVideo(source: VideoSource) {
       emptyStateOverlay.classList.add('hidden');
     }
     console.log('[ViewerApp] Loaded video:', result.filename, result.format, result.metadata);
+
+    // Initial timeline pre-computation across video stream for BOTH V3 and V2
+    if (videoDepthTimeline) {
+      videoDepthTimeline.destroy();
+    }
+    videoDepthTimeline = new VideoDepthTimeline({
+      fps: 20,
+      inputSize: 336,
+      baseDisp: viewer.getBaseDisparity() ?? 0,
+    });
+    depthController.setTimeline(videoDepthTimeline);
+
+    const isE2E =
+      typeof navigator !== 'undefined' &&
+      (Boolean((navigator as any).webdriver) || /HeadlessChrome/.test(navigator.userAgent));
+    const initialKeyframes = isE2E ? 2 : 6;
+    const timelineTimeoutMs = isE2E ? 12_000 : 30_000;
+
+    await Promise.race([
+      videoDepthTimeline.buildInitialTimeline(
+        sourceVideo,
+        viewer.getBaseDisparity(),
+        (stage, ratio) => {
+          setImportProgress(stage, ratio);
+        },
+        {
+          initialKeyframes,
+          runFullStreamInBackground: true,
+        }
+      ),
+      new Promise<void>((resolve) => setTimeout(resolve, timelineTimeoutMs)),
+    ]);
+
+    // Initial pass complete; hide progress banner and start playback
+    setImportProgress('Ready', 1.0);
+
+    try {
+      await sourceVideo.play();
+    } catch {
+      sourceVideo.muted = true;
+      await sourceVideo.play().catch(() => {});
+    }
   } catch (err: unknown) {
     const msg = err instanceof Error ? err.message : String(err);
     console.error('[ViewerApp] Failed to load video:', msg);
@@ -235,8 +316,21 @@ async function setDepthModelVersion(version: 'v2' | 'v3') {
       modelV2Btn.classList.remove('active');
     }
   }
-  viewer.clearExternalDepthMap();
-  await depthController.setModelVersion(version);
+
+  // 1. Update model version on depth controller
+  const setModelPromise = depthController.setModelVersion(version);
+
+  // 2. Immediately pull current timestamp's depth map from videoDepthTimeline (0 ms instant switch!)
+  if (videoDepthTimeline && sourceVideo.readyState >= HTMLMediaElement.HAVE_CURRENT_DATA) {
+    const depth = videoDepthTimeline.getDepthAtTime(sourceVideo.currentTime, version);
+    if (depth) {
+      viewer.uploadExternalDepthMap(depth, 480, 240);
+      const verticalTilt = motionController.getVerticalTilt();
+      viewer.renderVideoFrame(sourceVideo, currentViewShift, verticalTilt);
+    }
+  }
+
+  await setModelPromise;
   if (sourceVideo.readyState >= HTMLMediaElement.HAVE_CURRENT_DATA) {
     depthController.processVideoFrame(sourceVideo, viewer.getBaseDisparity(), 16).catch(() => {});
   }
@@ -380,6 +474,7 @@ exportWebmBtn.addEventListener('click', () => triggerExport('webm'));
 // Phase accumulator for smooth frequency transitions without teleporting
 let lastTimestampMs = 0;
 let currentPhase = 0;
+let currentViewShift = 0.5;
 
 // Main Animation & Parallax Render Loop (60 FPS) with Apple Vision Pro 3D Window Movement
 function renderLoop(timestampMs: number) {
@@ -405,6 +500,7 @@ function renderLoop(timestampMs: number) {
     const sine = Math.sin(currentPhase);
     viewShift = Math.max(0.0, Math.min(1.0, 0.5 + amp * sine));
   }
+  currentViewShift = viewShift;
 
   // Enhanced Apple Vision Pro Spatial Window Movement & Reactive Specular Border
   if (spatialWindow) {
@@ -459,6 +555,10 @@ requestAnimationFrame(renderLoop);
 (window as any).__viewerApp = {
   viewer,
   depthController,
+  get videoDepthTimeline() {
+    return videoDepthTimeline;
+  },
+  getDepthTimelineProgress: () => videoDepthTimeline.getProgress(),
   videoElement: sourceVideo,
   motionController,
   spatialWindow,

@@ -241,6 +241,10 @@ export class VideoDepthTimeline {
     };
   }
 
+  public getDepthDimensions(): { width: number; height: number } {
+    return { width: this.scratchWidth, height: this.scratchHeight };
+  }
+
   public getProgress(): TimelineProgress {
     const v3Frames = this.timelineV3.size;
     const v2Frames = this.timelineV2.size;
@@ -351,11 +355,15 @@ export class VideoDepthTimeline {
         off.preload = 'auto';
         if (video.src) {
           off.src = video.src;
+          off.load();
         }
         this.offscreenVideo = off;
       } catch {
         this.offscreenVideo = null;
       }
+    } else if (this.offscreenVideo && video.src && this.offscreenVideo.src !== video.src) {
+      this.offscreenVideo.src = video.src;
+      this.offscreenVideo.load();
     }
   }
 
@@ -373,7 +381,26 @@ export class VideoDepthTimeline {
 
     const sbsW = sourceVideo.videoWidth || 960;
     const sbsH = sourceVideo.videoHeight || 240;
-    const vid = this.offscreenVideo || sourceVideo;
+    let vid: HTMLVideoElement = sourceVideo;
+
+    if (this.offscreenVideo) {
+      if (this.offscreenVideo.readyState < 2) {
+        await new Promise<void>((resolve) => {
+          const timeout = setTimeout(resolve, 500);
+          this.offscreenVideo!.addEventListener(
+            'loadeddata',
+            () => {
+              clearTimeout(timeout);
+              resolve();
+            },
+            { once: true }
+          );
+        });
+      }
+      if (this.offscreenVideo.readyState >= 2) {
+        vid = this.offscreenVideo;
+      }
+    }
 
     if (!this.ctx) {
       return null;
@@ -760,7 +787,10 @@ export class VideoDepthTimeline {
     this.timelineV3.clear();
     this.timelineV2.clear();
     this.scratchBuffer = null;
-    this.offscreenVideo = null;
+    if (this.offscreenVideo) {
+      this.offscreenVideo.src = '';
+      this.offscreenVideo = null;
+    }
     this.canvas = null;
     this.ctx = null;
   }
