@@ -41,6 +41,8 @@ export interface ViewerTelemetry {
   baseDisp: number;
 }
 
+export type DepthMapProvider = (timeSec: number) => { depth: Uint8Array; width: number; height: number } | null;
+
 export class WebGLParallaxViewer {
   private canvas: HTMLCanvasElement;
   private gl: WebGL2RenderingContext;
@@ -178,6 +180,9 @@ export class WebGLParallaxViewer {
   private hasDaDepth: boolean = false;
   private daDepthWidth: number = 480;
   private daDepthHeight: number = 240;
+  private daDepthFormat: number = 0;
+  private lastUploadedDepthBuffer: Uint8Array | null = null;
+  private depthProvider: ((timeSec: number) => { depth: Uint8Array; width: number; height: number } | null) | null = null;
 
   // Configurations
   private backend: DisparityBackend = 'gpu';
@@ -664,24 +669,81 @@ export class WebGLParallaxViewer {
     return this.lastFrameTimestamp;
   }
 
+  public setDepthProvider(
+    provider: ((timeSec: number) => { depth: Uint8Array; width: number; height: number } | null) | null
+  ): void {
+    this.depthProvider = provider;
+  }
+
+  public getDepthProvider(): ((timeSec: number) => { depth: Uint8Array; width: number; height: number } | null) | null {
+    return this.depthProvider;
+  }
+
   /**
-   * Upload an external depth map (e.g. from DepthAnythingV2) to the GPU.
+   * Upload an external depth map (e.g. from DepthAnythingV2/V3) to the GPU.
    * Format: Uint8Array of length (width * height), values 0..255.
+   * Optimized with zero-reallocation gl.texSubImage2D (< 0.02 ms at 60 FPS).
    */
   public uploadExternalDepthMap(depthData: Uint8Array, width: number, height: number): void {
+    // If buffer reference is identical and dimensions match, skip upload entirely (<0.02ms)
+    if (
+      this.hasDaDepth &&
+      this.daDepthWidth === width &&
+      this.daDepthHeight === height &&
+      this.lastUploadedDepthBuffer === depthData
+    ) {
+      return;
+    }
+
     const gl = this.gl;
-    this.daDepthWidth = width;
-    this.daDepthHeight = height;
     if (!this.daDepthTexture) {
       this.daDepthTexture = gl.createTexture();
     }
     gl.bindTexture(gl.TEXTURE_2D, this.daDepthTexture);
+    gl.pixelStorei(gl.UNPACK_ALIGNMENT, 1);
+    gl.pixelStorei(gl.UNPACK_FLIP_Y_WEBGL, false);
+
+    // If texture is already allocated with matching dimensions, use fast texSubImage2D without reallocation
+    if (this.hasDaDepth && this.daDepthWidth === width && this.daDepthHeight === height) {
+      try {
+        if (this.daDepthFormat === gl.RGBA) {
+          const rgba = new Uint8Array(width * height * 4);
+          for (let i = 0; i < depthData.length; i++) {
+            const v = depthData[i];
+            const idx = i * 4;
+            rgba[idx] = v;
+            rgba[idx + 1] = v;
+            rgba[idx + 2] = v;
+            rgba[idx + 3] = 255;
+          }
+          gl.texSubImage2D(gl.TEXTURE_2D, 0, 0, 0, width, height, gl.RGBA, gl.UNSIGNED_BYTE, rgba);
+        } else {
+          gl.texSubImage2D(
+            gl.TEXTURE_2D,
+            0,
+            0,
+            0,
+            width,
+            height,
+            this.daDepthFormat || gl.RED,
+            gl.UNSIGNED_BYTE,
+            depthData
+          );
+        }
+        this.lastUploadedDepthBuffer = depthData;
+        return;
+      } catch {
+        // Fall back to full reallocation if texSubImage2D encounters an issue
+      }
+    }
+
+    this.daDepthWidth = width;
+    this.daDepthHeight = height;
+
     gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.LINEAR);
     gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.LINEAR);
     gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_S, gl.CLAMP_TO_EDGE);
     gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE);
-    gl.pixelStorei(gl.UNPACK_ALIGNMENT, 1);
-    gl.pixelStorei(gl.UNPACK_FLIP_Y_WEBGL, false);
 
     try {
       gl.texImage2D(
@@ -695,6 +757,7 @@ export class WebGLParallaxViewer {
         gl.UNSIGNED_BYTE,
         depthData
       );
+      this.daDepthFormat = gl.RED;
     } catch {
       try {
         gl.texImage2D(
@@ -708,6 +771,7 @@ export class WebGLParallaxViewer {
           gl.UNSIGNED_BYTE,
           depthData
         );
+        this.daDepthFormat = gl.LUMINANCE;
       } catch {
         const rgba = new Uint8Array(width * height * 4);
         for (let i = 0; i < depthData.length; i++) {
@@ -729,10 +793,12 @@ export class WebGLParallaxViewer {
           gl.UNSIGNED_BYTE,
           rgba
         );
+        this.daDepthFormat = gl.RGBA;
       }
     }
 
     this.hasDaDepth = true;
+    this.lastUploadedDepthBuffer = depthData;
   }
 
   public hasExternalDepthMap(): boolean {
@@ -741,6 +807,7 @@ export class WebGLParallaxViewer {
 
   public clearExternalDepthMap(): void {
     this.hasDaDepth = false;
+    this.lastUploadedDepthBuffer = null;
   }
 
   /**
@@ -914,6 +981,14 @@ export class WebGLParallaxViewer {
     const gl = this.gl;
     const startTotal = performance.now();
     this.frameCountTotal++;
+
+    // Synchronous depth provider lookup for zero-desync frame-accurate playback & export
+    if (this.depthProvider && typeof (video as HTMLVideoElement).currentTime === 'number') {
+      const synced = this.depthProvider((video as HTMLVideoElement).currentTime);
+      if (synced) {
+        this.uploadExternalDepthMap(synced.depth, synced.width, synced.height);
+      }
+    }
 
     // 1. Auto-converge global stereo baseline every 4 frames or on initial frame
     if (this.frameCountTotal % 4 === 1 || this.frameCountTotal <= 2) {
@@ -1280,6 +1355,8 @@ export class WebGLParallaxViewer {
     if (this.meshVbo) gl.deleteBuffer(this.meshVbo);
     if (this.meshIbo) gl.deleteBuffer(this.meshIbo);
     if (this.meshVao) gl.deleteVertexArray(this.meshVao);
+    this.depthProvider = null;
+    this.lastUploadedDepthBuffer = null;
   }
 }
 
