@@ -7,3 +7,5 @@ public/samples/
 tests/fixtures/
 .DS_Store
 *.log
+public/models/*.onnx
+public/onnx-wasm/

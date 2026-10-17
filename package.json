@@ -18,6 +18,7 @@
     "@ffmpeg/util": "^0.12.2",
     "coi-serviceworker": "^0.1.7",
     "mp4-muxer": "^5.2.2",
+    "onnxruntime-web": "^1.30.0",
     "webm-muxer": "^5.0.2"
   },
   "devDependencies": {
