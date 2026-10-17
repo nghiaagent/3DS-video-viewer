@@ -9,6 +9,7 @@ import {
   extractRightEyeRgba,
   computeZeroMeanSAD,
   DepthAnythingController,
+  VideoDepthTimeline,
 } from '../../src/depth/stereoGuidedDepth.js';
 import {
   initSession,
@@ -555,4 +556,248 @@ describe('stereoGuidedDepth & DepthAnything Integration', () => {
       expect(fs.existsSync(v2Heatmap)).toBe(true);
     }
   }, 30000);
+
+  it('runs dual-perspective (Left + Right eye) consensus depth inference on DepthAnythingV2', async () => {
+    const v2Path = path.resolve(__dirname, '../../public/models/depthanythingv2.onnx');
+    const wasmPaths = path.resolve(__dirname, '../../node_modules/onnxruntime-web/dist') + '/';
+
+    if (!fs.existsSync(v2Path)) {
+      console.log('Skipping dual-view V2 test (model not found)');
+      return;
+    }
+
+    const { session: sessionV2 } = await initSession({
+      modelPath: v2Path,
+      wasmPaths,
+      preferWebGPU: false,
+    });
+
+    let eyeW = 480;
+    let eyeH = 240;
+    let baseDisp = -70;
+    let sbsRgba: Uint8Array;
+    let leftRgba: Uint8Array;
+    let rightRgba: Uint8Array;
+
+    const rawSbsFile = '/tmp/hni_0062_sbs.raw';
+    if (fs.existsSync(rawSbsFile)) {
+      sbsRgba = new Uint8Array(fs.readFileSync(rawSbsFile));
+      leftRgba = extractLeftEyeRgba(sbsRgba, eyeW * 2, eyeH);
+      rightRgba = extractRightEyeRgba(sbsRgba, eyeW * 2, eyeH);
+    } else {
+      eyeW = 120;
+      eyeH = 60;
+      baseDisp = 0;
+      const syn = createSyntheticSBSFrame(eyeW, eyeH, 0, 16, 6, -6);
+      sbsRgba = syn.sbsRgba;
+      leftRgba = extractLeftEyeRgba(sbsRgba, eyeW * 2, eyeH);
+      rightRgba = extractRightEyeRgba(sbsRgba, eyeW * 2, eyeH);
+    }
+
+    // Pass both Left Eye and Right Eye to V2 at fast 336px
+    const infer = await runDepthInference(sessionV2, leftRgba, eyeW, eyeH, 336, rightRgba);
+    expect(infer.numViews).toBe(2);
+    expect(infer.rawDepth).toBeDefined();
+    expect(infer.rawDepth.length).toBe(eyeW * eyeH);
+    expect(infer.rawRightDepth).toBeDefined();
+    expect(infer.rawRightDepth!.length).toBe(eyeW * eyeH);
+
+    // Calibrate with stereo consensus fusion
+    const cal = calibrateDepthWithStereoSBS(infer.rawDepth, sbsRgba, baseDisp, 16, eyeW * 2, eyeH, {
+      expandRadius: 1,
+      rightDaDepth: infer.rawRightDepth,
+    });
+
+    expect(cal.width).toBe(eyeW);
+    expect(cal.height).toBe(eyeH);
+    expect(cal.calibratedDepth.length).toBe(eyeW * eyeH);
+    if (fs.existsSync(rawSbsFile)) {
+      expect(cal.sbsReconstructionMae).toBeLessThan(15.0);
+    }
+  });
+
+  it('VideoDepthTimeline pre-computes frame-accurate dual-perspective consensus depth timelines for both V3 and V2', async () => {
+    const eyeW = 60;
+    const eyeH = 30;
+    const sbsW = eyeW * 2;
+    const sbsH = eyeH;
+    const totalDuration = 2.0; // 2 seconds = 40 frames at 20 FPS
+    const fps = 20;
+    const totalFrames = 40;
+
+    // Generate synthetic SBS frames for all 40 frames
+    const mockFrames: Uint8Array[] = [];
+    for (let f = 0; f < totalFrames; f++) {
+      const shiftFg = 4 + (f % 3);
+      const shiftBg = -4 - (f % 2);
+      const syn = createSyntheticSBSFrame(eyeW, eyeH, 0, 16, shiftFg, shiftBg);
+      mockFrames.push(syn.sbsRgba);
+    }
+
+    const progressReports: Array<{ stage: string; ratio: number }> = [];
+
+    const timeline = new VideoDepthTimeline({
+      fps,
+      inputSize: 336,
+      baseDisp: 0,
+      maxDisp: 16,
+      frameExtractor: async (_timeSec, frameIndex) => {
+        return mockFrames[frameIndex] || mockFrames[0];
+      },
+      customInfer: async (_leftRgba, w, h, _size, rightRgba, modelVersion) => {
+        // Mock dual-perspective neural pass returning depth arrays for left and right
+        const leftDepth = new Float32Array(w * h);
+        const rightDepth = rightRgba ? new Float32Array(w * h) : undefined;
+        for (let i = 0; i < leftDepth.length; i++) {
+          leftDepth[i] = modelVersion === 'v3' ? 0.6 : 0.5;
+          if (rightDepth) rightDepth[i] = modelVersion === 'v3' ? 0.6 : 0.5;
+        }
+        return {
+          rawDepth: leftDepth,
+          rawRightDepth: rightDepth,
+          backend: 'wasm',
+          inferenceTimeMs: 2.0,
+        };
+      },
+    });
+
+    const mockVideo = {
+      duration: totalDuration,
+      videoWidth: sbsW,
+      videoHeight: sbsH,
+      currentTime: 0,
+      readyState: 4,
+    } as unknown as HTMLVideoElement;
+
+    // 1. Build initial timeline with 5 keyframes
+    await timeline.buildInitialTimeline(
+      mockVideo,
+      0,
+      (stage, ratio) => {
+        progressReports.push({ stage, ratio });
+      },
+      { initialKeyframes: 5, runFullStreamInBackground: true }
+    );
+
+    // Initial pre-pass progress was reported
+    expect(progressReports.length).toBeGreaterThan(0);
+    expect(timeline.isReady()).toBe(true);
+
+    // Keyframes were computed for both V3 and V2
+    expect(timeline.hasFrame(0, 'v3')).toBe(true);
+    expect(timeline.hasFrame(0, 'v2')).toBe(true);
+
+    // Exact keyframe query at t = 0.0s
+    const depthAtZeroV3 = timeline.getDepthForTime(0.0, 'v3');
+    expect(depthAtZeroV3).toBeDefined();
+    expect(depthAtZeroV3!.isExact).toBe(true);
+    expect(depthAtZeroV3!.frameIndex).toBe(0);
+    expect(depthAtZeroV3!.depth.length).toBe(eyeW * eyeH);
+
+    const depthAtZeroV2 = timeline.getDepthForTime(0.0, 'v2');
+    expect(depthAtZeroV2).toBeDefined();
+    expect(depthAtZeroV2!.isExact).toBe(true);
+
+    // Intermediate frame query at t = 0.05s (frame 1) before background worker finishes
+    // Temporal interpolation between keyframe 0 and keyframe 10 provides depth with zero desync!
+    const depthInterpV3 = timeline.getDepthForTime(0.05, 'v3');
+    expect(depthInterpV3).toBeDefined();
+    expect(depthInterpV3!.depth.length).toBe(eyeW * eyeH);
+
+    // 2. Wait for background worker to fill all 40 frames
+    await timeline.waitForAllFrames();
+    const progress = timeline.getProgress();
+    expect(progress.isComplete).toBe(true);
+    expect(progress.completedFrames).toBe(totalFrames);
+    expect(progress.v3Frames).toBe(totalFrames);
+    expect(progress.v2Frames).toBe(totalFrames);
+
+    // Now frame 1 is exact!
+    const depthExactV3 = timeline.getDepthForTime(0.05, 'v3');
+    expect(depthExactV3!.isExact).toBe(true);
+
+    // 3. Verify fast integration with DepthAnythingController
+    let controllerCallbackDepth: Uint8Array | null = null;
+    let controllerTelemetry: any = null;
+
+    const controller = new DepthAnythingController({
+      timeline,
+      onDepthMapReady: (calDepth, w, h, telemetry) => {
+        controllerCallbackDepth = calDepth;
+        controllerTelemetry = telemetry;
+        expect(w).toBe(eyeW);
+        expect(h).toBe(eyeH);
+      },
+    });
+
+    // Query controller with video element at currentTime = 0.5s (frame 10)
+    (mockVideo as any).currentTime = 0.5;
+    const handled = await controller.processVideoFrame(mockVideo);
+    expect(handled).toBe(true);
+    expect(controllerCallbackDepth).toBeDefined();
+    expect(controllerTelemetry).toBeDefined();
+    expect(controllerTelemetry.backend).toBe('timeline-cache');
+    expect(controllerTelemetry.inferenceTimeMs).toBe(0); // 0.0ms instant timeline lookup!
+    expect(controllerTelemetry.modelVersion).toBe('v3');
+
+    // Switch model to v2 and query
+    await controller.setModelVersion('v2');
+    controllerCallbackDepth = null;
+    const handledV2 = await controller.processVideoFrame(mockVideo);
+    expect(handledV2).toBe(true);
+    expect(controllerCallbackDepth).toBeDefined();
+    expect(controllerTelemetry.modelVersion).toBe('v2');
+
+    timeline.destroy();
+    controller.destroy();
+  });
+
+  it('VideoDepthTimeline precomputeFullVideo synchronously computes all frames', async () => {
+    const eyeW = 60;
+    const eyeH = 30;
+    const sbsW = eyeW * 2;
+    const sbsH = eyeH;
+    const totalFrames = 10;
+    const fps = 20;
+
+    const mockFrames: Uint8Array[] = [];
+    for (let f = 0; f < totalFrames; f++) {
+      const syn = createSyntheticSBSFrame(eyeW, eyeH, 0, 16, 4, -4);
+      mockFrames.push(syn.sbsRgba);
+    }
+
+    const timeline = new VideoDepthTimeline({
+      fps,
+      inputSize: 336,
+      frameExtractor: async (_timeSec, frameIndex) => mockFrames[frameIndex] || mockFrames[0],
+      customInfer: async (_left, w, h) => ({
+        rawDepth: new Float32Array(w * h).fill(0.5),
+        rawRightDepth: new Float32Array(w * h).fill(0.5),
+        backend: 'wasm',
+        inferenceTimeMs: 1.0,
+      }),
+    });
+
+    const mockVideo = {
+      duration: 0.5, // 10 frames
+      videoWidth: sbsW,
+      videoHeight: sbsH,
+      currentTime: 0,
+      readyState: 4,
+    } as unknown as HTMLVideoElement;
+
+    await timeline.precomputeFullVideo(mockVideo, 0);
+
+    const prog = timeline.getProgress();
+    expect(prog.isComplete).toBe(true);
+    expect(prog.completedFrames).toBe(totalFrames);
+
+    for (let f = 0; f < totalFrames; f++) {
+      expect(timeline.hasFrame(f, 'v3')).toBe(true);
+      expect(timeline.hasFrame(f, 'v2')).toBe(true);
+    }
+
+    timeline.destroy();
+  });
 });
+

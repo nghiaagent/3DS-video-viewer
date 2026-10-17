@@ -1,4 +1,5 @@
 import type { WorkerDepthResultMessage, WorkerInitMessage, WorkerInferMessage, WorkerOutMessage } from './depthAnythingWorker.js';
+import type { VideoDepthTimeline } from './videoDepthTimeline.js';
 
 export interface CalibrateDepthOptions {
   sbsWidth?: number;
@@ -61,6 +62,7 @@ export interface DepthAnythingControllerOptions {
   gradThreshold?: number;
   step?: number;
   contrastStretch?: boolean;
+  timeline?: VideoDepthTimeline;
   onDepthMapReady?: DepthMapReadyCallback;
   customInfer?: (
     leftRgba: Uint8Array,
@@ -689,6 +691,7 @@ export class DepthAnythingController {
   private frameStartTime: number = 0;
   private videoCanvas: HTMLCanvasElement | OffscreenCanvas | null = null;
   private videoCtx: CanvasRenderingContext2D | OffscreenCanvasRenderingContext2D | null = null;
+  private timeline: VideoDepthTimeline | null = null;
 
   constructor(
     options?: DepthAnythingControllerOptions,
@@ -705,6 +708,15 @@ export class DepthAnythingController {
     }
     if (options?.baseDisp !== undefined) this.baseDisp = options.baseDisp;
     if (options?.maxDisp !== undefined) this.maxDisp = options.maxDisp;
+    if (options?.timeline) this.timeline = options.timeline;
+  }
+
+  public setTimeline(timeline: VideoDepthTimeline | null): void {
+    this.timeline = timeline;
+  }
+
+  public getTimeline(): VideoDepthTimeline | null {
+    return this.timeline;
   }
 
   public isBusy(): boolean {
@@ -733,7 +745,7 @@ export class DepthAnythingController {
       : defaultModel;
     this.options.modelPath = modelPath;
 
-    if (this.worker) {
+    if (this.worker && typeof this.worker.addEventListener === 'function') {
       await new Promise<void>((resolve, reject) => {
         const timeout = setTimeout(() => resolve(), 15000);
         const handler = (e: MessageEvent<WorkerOutMessage>) => {
@@ -830,8 +842,7 @@ export class DepthAnythingController {
         return;
       }
 
-      if (typeof Worker === 'undefined') {
-        console.warn('DepthAnythingController: Web Worker is unavailable in this environment');
+      if (typeof Worker === 'undefined' || (typeof window === 'undefined' && !this.options.worker)) {
         this.initialized = true;
         return;
       }
@@ -1002,13 +1013,39 @@ export class DepthAnythingController {
     if (this.busy) {
       return false;
     }
-    if (!video || video.readyState < HTMLMediaElement.HAVE_CURRENT_DATA) {
+    const minReadyState = typeof HTMLMediaElement !== 'undefined' ? HTMLMediaElement.HAVE_CURRENT_DATA : 2;
+    if (!video || (video.readyState !== undefined && video.readyState < minReadyState)) {
       return false;
     }
     const sbsW = video.videoWidth;
     const sbsH = video.videoHeight;
     if (!sbsW || !sbsH) {
       return false;
+    }
+
+    // Fast-path: If pre-computed timeline has frame-accurate depth for video.currentTime, serve with zero desync!
+    if (this.timeline) {
+      const depth = this.timeline.getDepthAtTime(video.currentTime, this.modelVersion);
+      if (depth) {
+        const eyeWidth = Math.floor(sbsW / 2);
+        const eyeHeight = sbsH;
+        const telemetry: DepthTelemetry = {
+          inferenceTimeMs: 0,
+          totalTimeMs: 0,
+          scaleA: 1.0,
+          shiftB: 0.0,
+          sbsReconstructionMae: 0.0,
+          backend: 'timeline-cache',
+          fps: Math.round(this.currentFps * 10) / 10,
+          frameId: Math.round(video.currentTime * this.timeline.getFps()),
+          anchorCount: 0,
+          modelVersion: this.modelVersion,
+          numViews: 2,
+        };
+        this.lastTelemetry = telemetry;
+        this.options.onDepthMapReady?.(depth, eyeWidth, eyeHeight, telemetry);
+        return true;
+      }
     }
 
     if (!this.initialized && !this.initPromise) {
@@ -1073,7 +1110,7 @@ export class DepthAnythingController {
     this.pendingMaxDisp = effectiveMaxDisp;
 
     const leftEyeRgba = extractLeftEyeRgba(sbsRgba, sbsWidth, sbsHeight);
-    const rightEyeRgba = this.modelVersion === 'v3' ? extractRightEyeRgba(sbsRgba, sbsWidth, sbsHeight) : undefined;
+    const rightEyeRgba = extractRightEyeRgba(sbsRgba, sbsWidth, sbsHeight);
     const inputSize = this.options.inputSize || 504;
 
     if (this.options.customInfer) {
@@ -1137,3 +1174,10 @@ export class DepthAnythingController {
     this.videoCtx = null;
   }
 }
+
+export {
+  VideoDepthTimeline,
+  type VideoDepthTimelineOptions,
+  type TimelineDepthResult,
+  type TimelineProgress,
+} from './videoDepthTimeline.js';

@@ -6,6 +6,7 @@ export interface WorkerInitMessage {
   modelPath?: string;
   modelPathWebGPU?: string;
   preferWebGPU?: boolean;
+  modelVersion?: 'v3' | 'v2';
 }
 
 export interface WorkerInferMessage {
@@ -211,6 +212,7 @@ export async function initSession(options: {
   modelPath?: string;
   modelPathWebGPU?: string;
   preferWebGPU?: boolean;
+  modelVersion?: 'v3' | 'v2';
 }): Promise<{ session: ort.InferenceSession; backend: 'webgpu' | 'wasm' }> {
   let wasmPaths = options.wasmPaths || '/onnx-wasm/';
   if (typeof wasmPaths === 'string') {
@@ -229,7 +231,10 @@ export async function initSession(options: {
     ort.env.wasm.numThreads = Math.min(4, navigator.hardwareConcurrency || 2);
   }
 
-  let modelPath = options.modelPath || '/models/depthanythingv3.onnx';
+  const defaultModel = options.modelVersion === 'v2'
+    ? '/models/depthanythingv2.onnx'
+    : '/models/depthanythingv3.onnx';
+  let modelPath = options.modelPath || defaultModel;
   if (typeof self !== 'undefined' && self.location && !modelPath.startsWith('http://') && !modelPath.startsWith('https://') && !modelPath.startsWith('blob:')) {
     modelPath = new URL(modelPath, self.location.origin + '/').href;
   }
@@ -324,6 +329,14 @@ export async function runDepthInference(
   } else if (isV3) {
     inputTensor = new ort.Tensor('float32', leftPlanar, [1, 1, 3, size, size]);
     numViews = 1;
+  } else if (rightRgbaData) {
+    // Both perspectives for DepthAnything V2: [2, 3, size, size]
+    const { planarData: rightPlanar } = preprocessRgbaToPlanarTensor(rightRgbaData, width, height, size, true);
+    const stereoPlanar = new Float32Array(2 * 3 * size * size);
+    stereoPlanar.set(leftPlanar, 0);
+    stereoPlanar.set(rightPlanar, 3 * size * size);
+    inputTensor = new ort.Tensor('float32', stereoPlanar, [2, 3, size, size]);
+    numViews = 2;
   } else {
     // Monocular rank 4 [1, 3, H, W] for DepthAnything V2
     inputTensor = new ort.Tensor('float32', leftPlanar, [1, 3, size, size]);
@@ -336,10 +349,41 @@ export async function runDepthInference(
     results = await session.run({ [inputName]: inputTensor });
   } catch (err: any) {
     if (numViews === 2) {
-      console.warn('DepthAnythingWorker: 2-view stereo run failed, falling back to 1-view:', err?.message || err);
-      const singleViewTensor = new ort.Tensor('float32', leftPlanar, [1, 1, 3, size, size]);
-      results = await session.run({ [inputName]: singleViewTensor });
-      numViews = 1;
+      if (isV3) {
+        console.warn('DepthAnythingWorker: 2-view stereo run failed for V3, falling back to 1-view:', err?.message || err);
+        const singleViewTensor = new ort.Tensor('float32', leftPlanar, [1, 1, 3, size, size]);
+        results = await session.run({ [inputName]: singleViewTensor });
+        numViews = 1;
+      } else {
+        try {
+          console.warn('DepthAnythingWorker: batch 2 failed for V2, running 2 sequential single-view passes:', err?.message || err);
+          const tLeft = new ort.Tensor('float32', leftPlanar, [1, 3, size, size]);
+          const resLeft = await session.run({ [inputName]: tLeft });
+          const outKey = session.outputNames[0] || 'depth';
+          const leftOutTensor = resLeft[outKey];
+          const leftData = leftOutTensor.data as Float32Array;
+
+          const { planarData: rightPlanar } = preprocessRgbaToPlanarTensor(rightRgbaData!, width, height, size, true);
+          const tRight = new ort.Tensor('float32', rightPlanar, [1, 3, size, size]);
+          const resRight = await session.run({ [inputName]: tRight });
+          const rightOutTensor = resRight[outKey];
+          const rightData = rightOutTensor.data as Float32Array;
+
+          const combinedData = new Float32Array(leftData.length + rightData.length);
+          combinedData.set(leftData, 0);
+          combinedData.set(rightData, leftData.length);
+
+          const outDims = [2, ...leftOutTensor.dims.slice(1)];
+          results = {
+            [outKey]: new ort.Tensor('float32', combinedData, outDims),
+          };
+        } catch (seqErr) {
+          console.warn('DepthAnythingWorker: sequential 2-view V2 run failed, falling back to 1-view:', seqErr);
+          const singleViewTensor = new ort.Tensor('float32', leftPlanar, [1, 3, size, size]);
+          results = await session.run({ [inputName]: singleViewTensor });
+          numViews = 1;
+        }
+      }
     } else if (err && String(err.message).includes('Expected: 5')) {
       const tensor5D = new ort.Tensor('float32', leftPlanar, [1, 1, 3, size, size]);
       results = await session.run({ [inputName]: tensor5D });
