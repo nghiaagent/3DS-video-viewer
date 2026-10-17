@@ -37,4 +37,30 @@ describe('DCIM Catalog & Helper Functions', () => {
     expect(manifestFromBase).toBe('https://nghiaagent.github.io/3DS-video-viewer/samples/manifest.json');
     expect(coreUrlFromIndex).toBe('https://nghiaagent.github.io/3DS-video-viewer/ffmpeg/ffmpeg-core.js');
   });
+
+  it('strictly rejects non-AVI video files with clear error message', async () => {
+    const { import3DSVideo } = await import('../../src/importer/import3DSVideo.js');
+    const fakeVideo = {} as HTMLVideoElement;
+
+    // Test rejection of .mp4
+    await expect(
+      import3DSVideo({ name: 'HNI_0001.mp4', url: 'https://example.com/HNI_0001.mp4' }, fakeVideo)
+    ).rejects.toThrow('Only Nintendo 3DS .AVI recordings are supported.');
+
+    // Test rejection of .webm
+    await expect(
+      import3DSVideo({ name: 'HNI_0002.webm', url: 'https://example.com/HNI_0002.webm' }, fakeVideo)
+    ).rejects.toThrow('Only Nintendo 3DS .AVI recordings are supported.');
+
+    // Test rejection of .mov
+    await expect(
+      import3DSVideo({ name: 'HNI_0003.mov', url: 'https://example.com/HNI_0003.mov' }, fakeVideo)
+    ).rejects.toThrow('Only Nintendo 3DS .AVI recordings are supported.');
+
+    // Test rejection of File object with non-avi extension
+    const nonAviFile = { name: 'sample.mp4' } as File;
+    await expect(
+      import3DSVideo(nonAviFile, fakeVideo)
+    ).rejects.toThrow('Only Nintendo 3DS .AVI recordings are supported.');
+  });
 });

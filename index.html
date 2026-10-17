@@ -20,16 +20,24 @@
           <svg width="15" height="15" fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24">
             <path stroke-linecap="round" stroke-linejoin="round" d="M12 4v16m8-8H4" />
           </svg>
-          <span>Open Video</span>
+          <span>Choose .AVI File</span>
         </button>
-        <input type="file" id="file-input" accept=".avi,.mp4,.webm" style="display: none;" />
+        <input type="file" id="file-input" accept=".avi,.AVI,video/x-msvideo,video/avi" style="display: none;" />
 
         <div class="export-pill-group">
           <button class="glass-btn export-btn" id="export-mp4-btn" data-testid="export-mp4-btn" title="Export as MP4 (H.264)">
-            Export .MP4
+            <svg class="progress-ring" width="18" height="18" viewBox="0 0 20 20" aria-hidden="true">
+              <circle class="progress-ring-bg" cx="10" cy="10" r="8" />
+              <circle class="progress-ring-fill" cx="10" cy="10" r="8" />
+            </svg>
+            <span class="export-btn-label">Export .MP4</span>
           </button>
           <button class="glass-btn export-btn" id="export-webm-btn" data-testid="export-webm-btn" title="Export as WebM (VP9)">
-            Export .WebM
+            <svg class="progress-ring" width="18" height="18" viewBox="0 0 20 20" aria-hidden="true">
+              <circle class="progress-ring-bg" cx="10" cy="10" r="8" />
+              <circle class="progress-ring-fill" cx="10" cy="10" r="8" />
+            </svg>
+            <span class="export-btn-label">Export .WebM</span>
           </button>
         </div>
       </div>
@@ -55,15 +63,15 @@
               </svg>
             </div>
             <h2>Spatial 3DS Player</h2>
-            <p>Drop any Nintendo 3DS video here or click Open Video</p>
-            <span class="format-badge">Supports .AVI, .MP4, .WebM</span>
+            <p>Drop a 3DS .AVI video</p>
+            <span class="format-badge">Nintendo 3DS .AVI</span>
           </div>
         </div>
 
         <!-- Drag & Drop Active Overlay -->
         <div class="drop-overlay" id="drop-overlay">
           <div class="drop-card glass-panel">
-            <h2>Drop 3DS Video to Play</h2>
+            <h2>Drop 3DS .AVI Video to Play</h2>
           </div>
         </div>
 
@@ -106,10 +114,23 @@
         </select>
       </div>
 
+      <!-- Sway Speed Slider (for Gentle Sway) -->
+      <div class="dock-control" id="speed-dock-control">
+        <label for="freq-slider" class="dock-label">Speed</label>
+        <input type="range" class="vision-slider speed-slider" id="freq-slider" data-testid="freq-slider" min="0.08" max="0.80" step="0.02" value="0.28" title="Speed" />
+      </div>
+
       <!-- Spatial Depth Slider -->
-      <div class="dock-control">
+      <div class="dock-control" id="depth-dock-control">
         <label for="maxdisp-slider" class="dock-label">Depth</label>
-        <input type="range" class="vision-slider depth-slider" id="maxdisp-slider" min="8" max="36" step="2" value="24" title="Depth Intensity" />
+        <input type="range" class="vision-slider depth-slider" id="maxdisp-slider" min="8" max="36" step="2" value="24" title="Depth" />
+      </div>
+
+      <!-- Manual Shift Slider (for Manual Mode) -->
+      <div class="dock-control" id="manual-shift-group" style="display: none;">
+        <label for="manual-shift-slider" class="dock-label">Shift</label>
+        <input id="manual-shift-slider" type="range" class="vision-slider shift-slider" min="0" max="1" step="0.01" value="0.5" title="Shift" />
+        <span id="manual-shift-val" style="display: none;">0.50</span>
       </div>
 
       <!-- View Mode Selector -->
@@ -141,7 +162,6 @@
         <option value="offline" selected>offline</option>
         <option value="realtime">realtime</option>
       </select>
-      <div id="export-status" data-testid="export-status">Ready</div>
       <div class="shift-hud" data-testid="shift-indicator">
         <div id="shift-pin"></div>
       </div>
@@ -152,15 +172,9 @@
         <span id="telemetry-res">960×480</span>
         <span id="telemetry-shift">0.50</span>
       </div>
-      <div id="manual-shift-group">
-        <span id="manual-shift-val">0.50</span>
-        <input id="manual-shift-slider" type="range" min="0" max="1" step="0.01" value="0.5" />
-      </div>
       <input id="crop-slider" type="range" min="0" max="0.15" step="0.01" value="0.06" />
       <span id="crop-val">0.06</span>
       <span id="maxdisp-val">24</span>
-      <input id="freq-slider" type="range" min="0.05" max="1" step="0.01" value="0.28" />
-      <span id="freq-val">0.28 Hz</span>
       <input id="amp-slider" type="range" min="0" max="0.5" step="0.01" value="0.42" />
       <span id="amp-val">0.42</span>
     </div>

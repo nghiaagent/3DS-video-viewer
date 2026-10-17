@@ -67,136 +67,113 @@ export async function getFFmpeg(onProgress?: (progress: number) => void): Promis
 }
 
 /**
- * Imports any 3DS stereoscopic recording (.mp4, .webm, or raw dual-stream .AVI)
+ * Imports a Nintendo 3DS stereoscopic recording (.AVI dual-stream MJPEG)
  * and connects it to the target HTML5 <video> element.
  */
 export async function import3DSVideo(
   source: VideoSource,
   videoElement: HTMLVideoElement,
   onProgress?: (stage: string, ratio: number) => void
-): Promise<{ filename: string; format: 'sbs_mp4' | 'sbs_webm' | 'transcoded_avi'; objectUrl: string }> {
-  const fileName = source instanceof File ? source.name : source.name;
+): Promise<{ filename: string; format: 'transcoded_avi'; objectUrl: string }> {
+  let fileName = '';
   let ext = '';
-  if (source instanceof File) {
-    ext = source.name.toLowerCase().split('.').pop() || '';
+
+  const isFileInput = (typeof File !== 'undefined' && source instanceof File) || ('name' in source && !('url' in source));
+  if (isFileInput) {
+    fileName = source.name;
+    ext = (source.name || '').toLowerCase().split('.').pop() || '';
   } else {
-    const rawUrl = source.url.split('?')[0].toLowerCase();
+    fileName = source.name || '';
+    const rawUrl = (source.url || '').split('?')[0].toLowerCase();
     const urlExt = rawUrl.split('.').pop() || '';
-    const nameExt = source.name.toLowerCase().split('.').pop() || '';
-    if (['mp4', 'webm', 'avi', 'mpo'].includes(urlExt)) {
-      ext = urlExt;
-    } else if (['mp4', 'webm', 'avi', 'mpo'].includes(nameExt)) {
-      ext = nameExt;
+    const nameExt = fileName.toLowerCase().split('.').pop() || '';
+    if (urlExt === 'avi' || nameExt === 'avi') {
+      ext = 'avi';
     } else {
       ext = urlExt || nameExt;
     }
   }
 
-  // 1. FAST PATH: Standard Side-by-Side MP4 or WebM
-  if (ext === 'mp4' || ext === 'webm') {
-    onProgress?.('Loading video...', 0.3);
-    const objectUrl = source instanceof File ? URL.createObjectURL(source) : new URL(source.url, window.location.href).href;
-
-    videoElement.src = objectUrl;
-    videoElement.loop = true;
-
-    await waitForVideoLoaded(videoElement);
-
-    try {
-      await videoElement.play();
-    } catch {
-      // Autoplay with sound might be blocked by browser policy
-      videoElement.muted = true;
-      await videoElement.play();
-    }
-
-    onProgress?.('Ready', 1.0);
-    return {
-      filename: fileName,
-      format: ext === 'mp4' ? 'sbs_mp4' : 'sbs_webm',
-      objectUrl,
-    };
+  // Strictly enforce .AVI source format (no scope creep)
+  if (ext !== 'avi') {
+    throw new Error('Only Nintendo 3DS .AVI recordings are supported.');
   }
 
-  // 2. RAW 3DS .AVI PATH (Dual-stream Left/Right MJPEG)
-  if (ext === 'avi') {
-    onProgress?.('Initializing FFmpeg...', 0.1);
-    const ffmpeg = await getFFmpeg((ratio) => {
-      onProgress?.('Transcoding 3DS dual-stream AVI...', 0.3 + Math.min(1.0, Math.max(0.0, ratio)) * 0.6);
-    });
+  // Dual-stream Left/Right MJPEG 3DS .AVI transcoding path
+  onProgress?.('Initializing FFmpeg...', 0.1);
+  const ffmpeg = await getFFmpeg((ratio) => {
+    onProgress?.('Transcoding 3DS dual-stream AVI...', 0.3 + Math.min(1.0, Math.max(0.0, ratio)) * 0.6);
+  });
 
-    onProgress?.('Fetching AVI file...', 0.2);
-    const fileSource = source instanceof File ? source : new URL(source.url, window.location.href).href;
-    const fileData = await fetchFile(fileSource);
+  onProgress?.('Fetching AVI file...', 0.2);
+  const fileSource = source instanceof File ? source : (typeof window !== 'undefined' ? new URL(source.url, window.location.href).href : source.url);
+  const fileData = await fetchFile(fileSource);
 
-    const inputName = `input_${Date.now()}.avi`;
-    const outputName = `output_${Date.now()}.mp4`;
+  const inputName = `input_${Date.now()}.avi`;
+  const outputName = `output_${Date.now()}.mp4`;
 
-    await ffmpeg.writeFile(inputName, fileData);
+  await ffmpeg.writeFile(inputName, fileData);
 
-    onProgress?.('Transcoding dual MJPEG streams to SBS MP4...', 0.3);
-    const exitCode = await ffmpeg.exec([
-      '-i',
-      inputName,
-      '-filter_complex',
-      '[0:v:0][0:v:1]hstack=inputs=2[v]',
-      '-map',
-      '[v]',
-      '-map',
-      '0:a:0?',
-      '-c:v',
-      'libx264',
-      '-pix_fmt',
-      'yuv420p',
-      '-preset',
-      'ultrafast',
-      '-crf',
-      '18',
-      '-c:a',
-      'aac',
-      outputName,
-    ]);
+  onProgress?.('Transcoding dual MJPEG streams to SBS MP4...', 0.3);
+  const exitCode = await ffmpeg.exec([
+    '-i',
+    inputName,
+    '-filter_complex',
+    '[0:v:0][0:v:1]hstack=inputs=2[v]',
+    '-map',
+    '[v]',
+    '-map',
+    '0:a:0?',
+    '-c:v',
+    'libx264',
+    '-pix_fmt',
+    'yuv420p',
+    '-preset',
+    'ultrafast',
+    '-crf',
+    '18',
+    '-c:a',
+    'aac',
+    outputName,
+  ]);
 
-    if (exitCode !== 0) {
-      throw new Error(`FFmpeg transcoding failed with exit code ${exitCode}`);
-    }
-
-    const outputData = await ffmpeg.readFile(outputName);
-    const rawBytes = outputData as Uint8Array;
-    const copy = new Uint8Array(rawBytes.length);
-    copy.set(rawBytes);
-    const blob = new Blob([copy.buffer], { type: 'video/mp4' });
-    const objectUrl = URL.createObjectURL(blob);
-
-    // Clean up FFmpeg virtual filesystem
-    try {
-      await ffmpeg.deleteFile(inputName);
-      await ffmpeg.deleteFile(outputName);
-    } catch (e) {
-      console.warn('Error cleaning temporary FFmpeg files:', e);
-    }
-
-    videoElement.src = objectUrl;
-    videoElement.loop = true;
-
-    await waitForVideoLoaded(videoElement);
-
-    try {
-      await videoElement.play();
-    } catch {
-      videoElement.muted = true;
-      await videoElement.play();
-    }
-
-    onProgress?.('Ready', 1.0);
-    return {
-      filename: fileName,
-      format: 'transcoded_avi',
-      objectUrl,
-    };
+  if (exitCode !== 0) {
+    throw new Error(`FFmpeg transcoding failed with exit code ${exitCode}`);
   }
 
-  throw new Error(`Unsupported video format: .${ext}. Please provide .AVI, .MP4, or .WEBM.`);
+  const outputData = await ffmpeg.readFile(outputName);
+  const rawBytes = outputData as Uint8Array;
+  const copy = new Uint8Array(rawBytes.length);
+  copy.set(rawBytes);
+  const blob = new Blob([copy.buffer], { type: 'video/mp4' });
+  const objectUrl = URL.createObjectURL(blob);
+
+  // Clean up FFmpeg virtual filesystem
+  try {
+    await ffmpeg.deleteFile(inputName);
+    await ffmpeg.deleteFile(outputName);
+  } catch (e) {
+    console.warn('Error cleaning temporary FFmpeg files:', e);
+  }
+
+  videoElement.src = objectUrl;
+  videoElement.loop = true;
+
+  await waitForVideoLoaded(videoElement);
+
+  try {
+    await videoElement.play();
+  } catch {
+    videoElement.muted = true;
+    await videoElement.play();
+  }
+
+  onProgress?.('Ready', 1.0);
+  return {
+    filename: fileName,
+    format: 'transcoded_avi',
+    objectUrl,
+  };
 }
 
 function waitForVideoLoaded(video: HTMLVideoElement): Promise<void> {

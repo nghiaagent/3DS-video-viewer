@@ -30,13 +30,13 @@ const progressPercent = document.getElementById('progress-percent') as HTMLEleme
 const exportMp4Btn = document.getElementById('export-mp4-btn') as HTMLButtonElement;
 const exportWebmBtn = document.getElementById('export-webm-btn') as HTMLButtonElement;
 const exportModeSelect = document.getElementById('export-mode-select') as HTMLSelectElement | null;
-const exportStatus = document.getElementById('export-status') as HTMLElement | null;
 
 const backendSelect = document.getElementById('backend-select') as HTMLSelectElement | null;
 const renderModeSelect = document.getElementById('render-mode-select') as HTMLSelectElement;
 const upscaleSelect = document.getElementById('upscale-select') as HTMLSelectElement | null;
 const motionModeSelect = document.getElementById('motion-mode-select') as HTMLSelectElement;
 
+const speedDockControl = document.getElementById('speed-dock-control') as HTMLElement | null;
 const manualShiftGroup = document.getElementById('manual-shift-group') as HTMLElement | null;
 const manualShiftSlider = document.getElementById('manual-shift-slider') as HTMLInputElement | null;
 const manualShiftVal = document.getElementById('manual-shift-val') as HTMLElement | null;
@@ -227,18 +227,26 @@ maxdispSlider.addEventListener('input', () => {
   viewer.setMaxDisparity(val);
 });
 
-motionModeSelect.addEventListener('change', () => {
-  motionMode = motionModeSelect.value as 'auto' | 'interactive' | 'manual';
-  if (motionMode === 'manual') {
+function updateMotionModeUI(mode: 'auto' | 'interactive' | 'manual') {
+  if (mode === 'manual') {
     if (manualShiftGroup) manualShiftGroup.style.display = 'flex';
+    if (speedDockControl) speedDockControl.style.display = 'none';
     motionController.detach();
-  } else if (motionMode === 'interactive') {
+  } else if (mode === 'interactive') {
     if (manualShiftGroup) manualShiftGroup.style.display = 'none';
+    if (speedDockControl) speedDockControl.style.display = 'none';
     motionController.attach(viewportContainer);
   } else {
+    // Gentle Sway mode
     if (manualShiftGroup) manualShiftGroup.style.display = 'none';
+    if (speedDockControl) speedDockControl.style.display = 'flex';
     motionController.detach();
   }
+}
+
+motionModeSelect.addEventListener('change', () => {
+  motionMode = motionModeSelect.value as 'auto' | 'interactive' | 'manual';
+  updateMotionModeUI(motionMode);
 });
 
 if (manualShiftSlider) {
@@ -249,36 +257,47 @@ if (manualShiftSlider) {
   });
 }
 
-// Hardware GPU Video Export Wiring
+// Circular Export Progress Helper
+function setExportProgress(btn: HTMLButtonElement, progress: number) {
+  const circle = btn.querySelector<SVGCircleElement>('.progress-ring-fill');
+  if (circle) {
+    const circumference = 2 * Math.PI * 8; // ~50.2655
+    const clampedProgress = Math.max(0, Math.min(1, progress));
+    const offset = circumference * (1 - clampedProgress);
+    circle.style.strokeDashoffset = `${offset.toFixed(2)}px`;
+  }
+}
+
+// Hardware GPU Video Export Wiring (Circular Progress Rings, Zero Text Clutter)
 async function triggerExport(format: ExportFormat) {
   if (isExporting) return;
   isExporting = true;
   exportMp4Btn.disabled = true;
   exportWebmBtn.disabled = true;
-  if (exportStatus) exportStatus.textContent = `Exporting ${format.toUpperCase()}...`;
+
+  const activeBtn = format === 'mp4' ? exportMp4Btn : exportWebmBtn;
+  activeBtn.classList.add('is-exporting');
+  setExportProgress(activeBtn, 0);
 
   const mode: ExportMode = (exportModeSelect?.value as ExportMode) || 'offline';
 
   try {
     if (mode === 'offline') {
-      const result = await exportParallaxVideo(format, 'offline', viewer, sourceVideo, {
+      await exportParallaxVideo(format, 'offline', viewer, sourceVideo, {
         fps: 60,
         maxDurationSec: 30,
         triggerDownload: true,
-        onProgress: (p, frame, total) => {
-          const pct = Math.round(p * 100);
-          if (exportStatus) exportStatus.textContent = `Exporting ${format.toUpperCase()}: ${frame}/${total} (${pct}%)...`;
+        onProgress: (p) => {
+          setExportProgress(activeBtn, p);
         },
       });
-      if (exportStatus) exportStatus.textContent = `Saved ${(result as any).filename}`;
     } else {
       const session = (await exportParallaxVideo(format, 'realtime', viewer, sourceVideo, {
         triggerDownload: true,
       })) as any;
 
       const onStopClick = async () => {
-        const res = await session.stop();
-        if (exportStatus) exportStatus.textContent = `Saved ${res.filename}`;
+        await session.stop();
         cleanup();
       };
 
@@ -286,6 +305,8 @@ async function triggerExport(format: ExportFormat) {
         isExporting = false;
         exportMp4Btn.disabled = false;
         exportWebmBtn.disabled = false;
+        activeBtn.classList.remove('is-exporting');
+        setExportProgress(activeBtn, 0);
         exportMp4Btn.removeEventListener('click', onStopClick);
         exportWebmBtn.removeEventListener('click', onStopClick);
       };
@@ -295,22 +316,32 @@ async function triggerExport(format: ExportFormat) {
       return;
     }
   } catch (err: unknown) {
-    const msg = err instanceof Error ? err.message : String(err);
     console.error('[Export Failed]', err);
-    if (exportStatus) exportStatus.textContent = `Export failed: ${msg}`;
   } finally {
     isExporting = false;
     exportMp4Btn.disabled = false;
     exportWebmBtn.disabled = false;
+    activeBtn.classList.remove('is-exporting');
+    setExportProgress(activeBtn, 0);
   }
 }
 
 exportMp4Btn.addEventListener('click', () => triggerExport('mp4'));
 exportWebmBtn.addEventListener('click', () => triggerExport('webm'));
 
-// Main Animation & Parallax Render Loop (60 FPS) with 3D Spatial Window Movement
+// Phase accumulator for smooth frequency transitions without teleporting
+let lastTimestampMs = 0;
+let currentPhase = 0;
+
+// Main Animation & Parallax Render Loop (60 FPS) with Apple Vision Pro 3D Window Movement
 function renderLoop(timestampMs: number) {
   if (!isLoopRunning) return;
+
+  if (!lastTimestampMs) {
+    lastTimestampMs = timestampMs;
+  }
+  const dtSeconds = Math.min(Math.max(0, (timestampMs - lastTimestampMs) / 1000.0), 0.1);
+  lastTimestampMs = timestampMs;
 
   let viewShift = 0.5;
 
@@ -319,30 +350,32 @@ function renderLoop(timestampMs: number) {
   } else if (motionMode === 'interactive') {
     viewShift = motionController.update(timestampMs);
   } else {
-    // Auto 0.28Hz Sine Wave
+    // Gentle Sway mode: accumulate phase based on frequency slider to eliminate teleporting jumps
     const freq = freqSlider ? parseFloat(freqSlider.value) : 0.28;
     const amp = ampSlider ? parseFloat(ampSlider.value) : 0.42;
-    const sine = Math.sin((timestampMs / 1000.0) * freq * Math.PI * 2.0);
+    currentPhase = (currentPhase + dtSeconds * freq * Math.PI * 2.0) % (Math.PI * 2.0);
+    const sine = Math.sin(currentPhase);
     viewShift = Math.max(0.0, Math.min(1.0, 0.5 + amp * sine));
   }
 
-  // Apple Vision Pro Moving Spatial Window Motion
+  // Enhanced Apple Vision Pro Spatial Window Movement & Reactive Specular Border
   if (spatialWindow) {
     const s = (viewShift - 0.5) * 2.0; // [-1.0, +1.0]
     const v = motionController.getVerticalTilt(); // [-1.0, +1.0]
 
-    const tx = s * 18.0; // horizontal drift px
-    const ty = v * 8.0;  // vertical drift px
-    const ry = -s * 6.5; // Y-axis rotation in degrees
-    const rx = v * 4.0;  // X-axis rotation in degrees
+    const tx = s * 26.0; // horizontal drift px
+    const ty = v * 10.0; // vertical drift px
+    const ry = -s * 8.0; // Y-axis rotation in degrees
+    const rx = v * 5.0;  // X-axis rotation in degrees
 
-    spatialWindow.style.transform = `translateX(${tx.toFixed(2)}px) translateY(${ty.toFixed(2)}px) rotateY(${ry.toFixed(2)}deg) rotateX(${rx.toFixed(2)}deg)`;
+    spatialWindow.style.transform = `translate3d(${tx.toFixed(2)}px, ${ty.toFixed(2)}px, 0px) rotateY(${ry.toFixed(2)}deg) rotateX(${rx.toFixed(2)}deg)`;
+    spatialWindow.style.setProperty('--window-shift', s.toFixed(3));
 
-    const shadowX = (-s * 28.0).toFixed(1);
+    const shadowX = (-s * 32.0).toFixed(1);
     spatialWindow.style.boxShadow = `${shadowX}px 32px 80px rgba(0, 0, 0, 0.85), 0 0 90px rgba(56, 189, 248, 0.08), 0 0 0 1px rgba(255, 255, 255, 0.14)`;
 
     if (ambientGlow) {
-      ambientGlow.style.transform = `translateX(${(-s * 45).toFixed(1)}px)`;
+      ambientGlow.style.transform = `translate3d(${(-s * 50).toFixed(1)}px, 0px, 0px)`;
     }
   }
 
@@ -383,10 +416,12 @@ requestAnimationFrame(renderLoop);
   setMotionMode: (mode: 'auto' | 'interactive' | 'manual') => {
     motionMode = mode;
     motionModeSelect.value = mode;
+    updateMotionModeUI(mode);
   },
   setManualShift: (shift: number) => {
     motionMode = 'manual';
     motionModeSelect.value = 'manual';
+    updateMotionModeUI('manual');
     if (manualShiftGroup) manualShiftGroup.style.display = 'flex';
     if (manualShiftSlider) manualShiftSlider.value = String(shift);
     if (manualShiftVal) manualShiftVal.textContent = shift.toFixed(2);
