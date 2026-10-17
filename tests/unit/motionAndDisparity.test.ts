@@ -387,4 +387,50 @@ describe('Rust Wasm SIMD Disparity Integration', () => {
   });
 });
 
+describe('Tiefling Full-Resolution DepthAnything & 200x120 Mesh Geometry', () => {
+  it('preserves full native DepthAnything resolution without blurring in shaders', () => {
+    // 1. Perspective Window Frag (Disparity Heatmap): Direct 1:1 sampling when u_dispTexelSize.x < 0.005
+    expect(PERSPECTIVE_WINDOW_FRAG_SOURCE).toContain('u_dispTexelSize.x < 0.005');
+    expect(PERSPECTIVE_WINDOW_FRAG_SOURCE).toContain('dVal = texture(u_dispTexture, eyeUV).r;');
+
+    // 2. Tiefling Mesh Vertex: Direct tight 1-texel sampling when u_dispTexelSize.x < 0.005
+    expect(TIEFLING_MESH_VERTEX_SHADER_SOURCE).toContain('u_dispTexelSize.x < 0.005');
+    expect(TIEFLING_MESH_VERTEX_SHADER_SOURCE).toContain('depth = texture(u_dispTexture, sampleUV).r;');
+
+    // 3. Fallback stereo depth filter: tightened sigmas for crisp edge transitions
+    expect(TIEFLING_DEPTH_FILTER_FRAG_SOURCE).toContain('twoSigmaSpatialSq = 6.0;');
+    expect(TIEFLING_DEPTH_FILTER_FRAG_SOURCE).toContain('twoSigmaColorSq = 0.015;');
+  });
+
+  it('validates 200x120 mesh geometry vertices and Uint16Array index bounds', () => {
+    const gridW = 200;
+    const gridH = 120;
+    const numVerts = (gridW + 1) * (gridH + 1); // 201 * 121 = 24,321
+    const numQuads = gridW * gridH; // 24,000
+    const numIndices = numQuads * 6; // 144,000
+
+    expect(numVerts).toBe(24321);
+    expect(numIndices).toBe(144000);
+    // WebGL1 / WebGL2 UNSIGNED_SHORT index limit is 65,535
+    expect(numVerts).toBeLessThan(65535);
+
+    // Verify getter returns 200x120 grid
+    const dummyViewer = Object.create(WebGLParallaxViewer.prototype);
+    expect(dummyViewer.getMeshGridDimensions()).toEqual({ width: 200, height: 120 });
+  });
+
+  it('manages external depth map state and dimensions correctly', () => {
+    const dummyViewer = Object.create(WebGLParallaxViewer.prototype);
+    dummyViewer.hasDaDepth = false;
+    dummyViewer.daDepthWidth = 480;
+    dummyViewer.daDepthHeight = 240;
+
+    expect(dummyViewer.hasExternalDepthMap()).toBe(false);
+    expect(dummyViewer.getDaDepthDimensions()).toEqual({ width: 480, height: 240 });
+
+    dummyViewer.clearExternalDepthMap();
+    expect(dummyViewer.hasExternalDepthMap()).toBe(false);
+  });
+});
+
 

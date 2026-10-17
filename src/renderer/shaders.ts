@@ -39,10 +39,10 @@ void main() {
     float sumWeights = 0.0;
     float sumFilteredD = 0.0;
 
-    // Continuous branchless Gaussian spatial weight: sigmaSpatial = 2.8 -> 2 * sigma^2 = 15.68
-    const float twoSigmaSpatialSq = 15.68;
-    // Joint guided filter / color-prior smoothness: sigma_c = 0.20 -> 2 * sigma_c^2 = 0.08
-    const float twoSigmaColorSq = 0.08;
+    // Continuous branchless Gaussian spatial weight: tightened to twoSigmaSpatialSq = 6.0 for sharp edges
+    const float twoSigmaSpatialSq = 6.0;
+    // Joint guided filter / color-prior smoothness: tightened to twoSigmaColorSq = 0.015 for sharp object boundaries
+    const float twoSigmaColorSq = 0.015;
 
     for (int dy = -4; dy <= 4; dy++) {
         for (int dx = -4; dx <= 4; dx++) {
@@ -115,12 +115,19 @@ void main() {
 
     // Tiefling 3D Parallax Mesh mode
     vec2 sampleUV = clamp(vec2(u_windowCrop + uv.x * (1.0 - 2.0 * u_windowCrop), uv.y), 0.0, 1.0);
-    float dC = texture(u_dispTexture, sampleUV).r;
-    float dL = texture(u_dispTexture, clamp(sampleUV - vec2(u_dispTexelSize.x, 0.0), 0.0, 1.0)).r;
-    float dR = texture(u_dispTexture, clamp(sampleUV + vec2(u_dispTexelSize.x, 0.0), 0.0, 1.0)).r;
-    float dU = texture(u_dispTexture, clamp(sampleUV + vec2(0.0, u_dispTexelSize.y), 0.0, 1.0)).r;
-    float dD = texture(u_dispTexture, clamp(sampleUV - vec2(0.0, u_dispTexelSize.y), 0.0, 1.0)).r;
-    float depth = dC * 0.4 + (dL + dR + dU + dD) * 0.15;
+    float depth;
+    if (u_dispTexelSize.x < 0.005) {
+        // High-resolution DepthAnything V2 / V3: tight 1-texel sample preserving razor-sharp silhouettes
+        depth = texture(u_dispTexture, sampleUV).r;
+    } else {
+        // Fallback coarse disparity 5-tap smooth sample
+        float dC = texture(u_dispTexture, sampleUV).r;
+        float dL = texture(u_dispTexture, clamp(sampleUV - vec2(u_dispTexelSize.x, 0.0), 0.0, 1.0)).r;
+        float dR = texture(u_dispTexture, clamp(sampleUV + vec2(u_dispTexelSize.x, 0.0), 0.0, 1.0)).r;
+        float dU = texture(u_dispTexture, clamp(sampleUV + vec2(0.0, u_dispTexelSize.y), 0.0, 1.0)).r;
+        float dD = texture(u_dispTexture, clamp(sampleUV - vec2(0.0, u_dispTexelSize.y), 0.0, 1.0)).r;
+        depth = dC * 0.4 + (dL + dR + dU + dD) * 0.15;
+    }
     float z = depth * u_meshDepth;
 
     // Tiefling exact perspective compensation (cameraZ = 4.0)
@@ -435,12 +442,19 @@ void main() {
 
     // Mode 1: Disparity Heatmap
     if (u_renderMode == 1) {
-        float dC = texture(u_dispTexture, eyeUV).r;
-        float dL = texture(u_dispTexture, clamp(eyeUV - vec2(u_dispTexelSize.x, 0.0), 0.0, 1.0)).r;
-        float dR = texture(u_dispTexture, clamp(eyeUV + vec2(u_dispTexelSize.x, 0.0), 0.0, 1.0)).r;
-        float dU = texture(u_dispTexture, clamp(eyeUV + vec2(0.0, u_dispTexelSize.y), 0.0, 1.0)).r;
-        float dD = texture(u_dispTexture, clamp(eyeUV - vec2(0.0, u_dispTexelSize.y), 0.0, 1.0)).r;
-        float dVal = dC * 0.4 + (dL + dR + dU + dD) * 0.15;
+        float dVal;
+        if (u_dispTexelSize.x < 0.005) {
+            // Full-resolution DepthAnything V2 / V3: preserve razor-sharp edges without blur
+            dVal = texture(u_dispTexture, eyeUV).r;
+        } else {
+            // Fallback coarse disparity: 5-tap smooth sample
+            float dC = texture(u_dispTexture, eyeUV).r;
+            float dL = texture(u_dispTexture, clamp(eyeUV - vec2(u_dispTexelSize.x, 0.0), 0.0, 1.0)).r;
+            float dR = texture(u_dispTexture, clamp(eyeUV + vec2(u_dispTexelSize.x, 0.0), 0.0, 1.0)).r;
+            float dU = texture(u_dispTexture, clamp(eyeUV + vec2(0.0, u_dispTexelSize.y), 0.0, 1.0)).r;
+            float dD = texture(u_dispTexture, clamp(eyeUV - vec2(0.0, u_dispTexelSize.y), 0.0, 1.0)).r;
+            dVal = dC * 0.4 + (dL + dR + dU + dD) * 0.15;
+        }
         vec3 heatmap = turboColormap(dVal);
         outColor = vec4(heatmap, 1.0);
         return;

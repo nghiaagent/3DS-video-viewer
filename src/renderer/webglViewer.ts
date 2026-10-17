@@ -48,7 +48,7 @@ export class WebGLParallaxViewer {
   private vao: WebGLVertexArrayObject | null = null;
   private vbo: WebGLBuffer | null = null;
 
-  // Subdivided 3D mesh for Tiefling Parallax Mesh mode (gridW = 120, gridH = 72)
+  // Subdivided 3D mesh for Tiefling Parallax Mesh mode (gridW = 200, gridH = 120)
   private meshVao: WebGLVertexArrayObject | null = null;
   private meshVbo: WebGLBuffer | null = null;
   private meshIbo: WebGLBuffer | null = null;
@@ -176,6 +176,8 @@ export class WebGLParallaxViewer {
   // External DepthAnything depth map texture and state
   private daDepthTexture: WebGLTexture | null = null;
   private hasDaDepth: boolean = false;
+  private daDepthWidth: number = 480;
+  private daDepthHeight: number = 240;
 
   // Configurations
   private backend: DisparityBackend = 'gpu';
@@ -376,8 +378,8 @@ export class WebGLParallaxViewer {
 
   private initMeshGeometry(): void {
     const gl = this.gl;
-    const gridW = 120;
-    const gridH = 72;
+    const gridW = 200;
+    const gridH = 120;
     const numVerts = (gridW + 1) * (gridH + 1);
     const uvs = new Float32Array(numVerts * 2);
 
@@ -412,7 +414,7 @@ export class WebGLParallaxViewer {
         indices[iIdx++] = i3;
       }
     }
-    this.meshIndexCount = indices.length; // 51,840 indices
+    this.meshIndexCount = indices.length; // 200 * 120 * 6 = 144,000 indices
 
     this.meshVao = gl.createVertexArray();
     gl.bindVertexArray(this.meshVao);
@@ -668,6 +670,8 @@ export class WebGLParallaxViewer {
    */
   public uploadExternalDepthMap(depthData: Uint8Array, width: number, height: number): void {
     const gl = this.gl;
+    this.daDepthWidth = width;
+    this.daDepthHeight = height;
     if (!this.daDepthTexture) {
       this.daDepthTexture = gl.createTexture();
     }
@@ -924,32 +928,34 @@ export class WebGLParallaxViewer {
 
     let dispMs = 0;
 
-    if (this.backend === 'gpu') {
-      const startDisp = performance.now();
-      this.runGpuDisparityPass();
-      this.runDepthFilterPass();
-      dispMs = performance.now() - startDisp;
-    } else {
-      const wasmEngine = await WasmDisparityEngine.getInstance();
-      const res = wasmEngine.computeFromVideo(video as CanvasImageSource, true);
-      dispMs = res.telemetry.computeTimeMs;
+    if (!this.hasDaDepth) {
+      if (this.backend === 'gpu') {
+        const startDisp = performance.now();
+        this.runGpuDisparityPass();
+        this.runDepthFilterPass();
+        dispMs = performance.now() - startDisp;
+      } else {
+        const wasmEngine = await WasmDisparityEngine.getInstance();
+        const res = wasmEngine.computeFromVideo(video as CanvasImageSource, true);
+        dispMs = res.telemetry.computeTimeMs;
 
-      // Upload disparity map to current ping-pong disparity texture
-      gl.activeTexture(gl.TEXTURE1);
-      gl.bindTexture(gl.TEXTURE_2D, this.dispTextures[this.pingPongIdx]);
-      gl.pixelStorei(gl.UNPACK_ALIGNMENT, 1);
-      gl.texImage2D(
-        gl.TEXTURE_2D,
-        0,
-        gl.R8,
-        res.telemetry.eyeWidth,
-        res.telemetry.eyeHeight,
-        0,
-        gl.RED,
-        gl.UNSIGNED_BYTE,
-        res.disparityMap
-      );
-      this.runDepthFilterPass();
+        // Upload disparity map to current ping-pong disparity texture
+        gl.activeTexture(gl.TEXTURE1);
+        gl.bindTexture(gl.TEXTURE_2D, this.dispTextures[this.pingPongIdx]);
+        gl.pixelStorei(gl.UNPACK_ALIGNMENT, 1);
+        gl.texImage2D(
+          gl.TEXTURE_2D,
+          0,
+          gl.R8,
+          res.telemetry.eyeWidth,
+          res.telemetry.eyeHeight,
+          0,
+          gl.RED,
+          gl.UNSIGNED_BYTE,
+          res.disparityMap
+        );
+        this.runDepthFilterPass();
+      }
     }
 
     // 3. Render perspective window to canvas backbuffer
@@ -1009,7 +1015,7 @@ export class WebGLParallaxViewer {
     gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA, sbsWidth, sbsHeight, 0, gl.RGBA, gl.UNSIGNED_BYTE, sbsRgba);
 
     let dispMs = 0;
-    if (this.backend === 'gpu') {
+    if (!this.hasDaDepth && this.backend === 'gpu') {
       const startDisp = performance.now();
       this.runGpuDisparityPass();
       this.runDepthFilterPass();
@@ -1135,6 +1141,17 @@ export class WebGLParallaxViewer {
     gl.bindFramebuffer(gl.FRAMEBUFFER, null);
     gl.viewport(0, 0, this.canvas.width, this.canvas.height);
 
+    const activeDispTexture = (this.hasDaDepth && this.daDepthTexture)
+      ? this.daDepthTexture
+      : (this.filteredDispTexture ?? this.dispTextures[currDispIdx]);
+
+    const activeDispTexelX = (this.hasDaDepth && this.daDepthWidth > 0)
+      ? 1.0 / this.daDepthWidth
+      : 1.0 / this.dispWidth;
+    const activeDispTexelY = (this.hasDaDepth && this.daDepthHeight > 0)
+      ? 1.0 / this.daDepthHeight
+      : 1.0 / this.dispHeight;
+
     if (this.renderMode === 0) {
       gl.enable(gl.DEPTH_TEST);
       gl.depthFunc(gl.LEQUAL);
@@ -1149,7 +1166,7 @@ export class WebGLParallaxViewer {
       gl.uniform1i(this.tieflingLocs.sbsTexture, 0);
 
       gl.activeTexture(gl.TEXTURE1);
-      gl.bindTexture(gl.TEXTURE_2D, this.filteredDispTexture ?? this.dispTextures[currDispIdx]);
+      gl.bindTexture(gl.TEXTURE_2D, activeDispTexture);
       gl.uniform1i(this.tieflingLocs.dispTexture, 1);
 
       gl.uniform1f(this.tieflingLocs.viewShift, clampedShift);
@@ -1165,7 +1182,7 @@ export class WebGLParallaxViewer {
         gl.uniform2f(this.tieflingLocs.eyeTexelSize, 1.0 / this.eyeWidth, 1.0 / this.eyeHeight);
       }
       if (this.tieflingLocs.dispTexelSize) {
-        gl.uniform2f(this.tieflingLocs.dispTexelSize, 1.0 / this.dispWidth, 1.0 / this.dispHeight);
+        gl.uniform2f(this.tieflingLocs.dispTexelSize, activeDispTexelX, activeDispTexelY);
       }
       if (this.tieflingLocs.maxDisparityUV) {
         gl.uniform1f(this.tieflingLocs.maxDisparityUV, Math.min(0.04, this.maxDisp / this.eyeWidth));
@@ -1190,14 +1207,14 @@ export class WebGLParallaxViewer {
       gl.uniform1i(this.perspLocs.sbsTexture, 0);
 
       gl.activeTexture(gl.TEXTURE1);
-      gl.bindTexture(gl.TEXTURE_2D, this.filteredDispTexture ?? this.dispTextures[currDispIdx]);
+      gl.bindTexture(gl.TEXTURE_2D, activeDispTexture);
       gl.uniform1i(this.perspLocs.dispTexture, 1);
 
       gl.uniform1f(this.perspLocs.viewShift, clampedShift);
       gl.uniform1f(this.perspLocs.maxDisparityUV, Math.min(0.04, this.maxDisp / this.eyeWidth));
       gl.uniform1f(this.perspLocs.windowCrop, this.windowCrop);
       gl.uniform2f(this.perspLocs.eyeTexelSize, 1.0 / this.eyeWidth, 1.0 / this.eyeHeight);
-      gl.uniform2f(this.perspLocs.dispTexelSize, 1.0 / this.dispWidth, 1.0 / this.dispHeight);
+      gl.uniform2f(this.perspLocs.dispTexelSize, activeDispTexelX, activeDispTexelY);
       gl.uniform1f(this.perspLocs.zeroDispNorm, 0.5);
       gl.uniform1i(this.perspLocs.baseDisp, this.baseDisp);
       gl.uniform1i(this.perspLocs.renderMode, this.renderMode);
@@ -1228,6 +1245,18 @@ export class WebGLParallaxViewer {
 
   public getGLContext(): WebGL2RenderingContext {
     return this.gl;
+  }
+
+  public getMeshIndexCount(): number {
+    return this.meshIndexCount;
+  }
+
+  public getMeshGridDimensions(): { width: number; height: number } {
+    return { width: 200, height: 120 };
+  }
+
+  public getDaDepthDimensions(): { width: number; height: number } {
+    return { width: this.daDepthWidth, height: this.daDepthHeight };
   }
 
   public destroy(): void {
