@@ -30,6 +30,7 @@ export interface DepthTelemetry {
   backend: string;
   fps: number;
   frameId: number;
+  anchorCount?: number;
 }
 
 export type DepthMapReadyCallback = (
@@ -49,6 +50,7 @@ export interface DepthAnythingControllerOptions {
   baseDisp?: number;
   maxDisp?: number;
   expandRadius?: number;
+  dilateRadius?: number;
   gradThreshold?: number;
   step?: number;
   onDepthMapReady?: DepthMapReadyCallback;
@@ -604,6 +606,7 @@ export function calibrateDepthWithStereoSBS(
  * Non-blocking isBusy flag ensures the 60 FPS WebGL render loop never stalls.
  */
 export class DepthAnythingController {
+  public lastTelemetry: DepthTelemetry | null = null;
   private worker: Worker | null = null;
   private busy: boolean = false;
   private baseDisp: number = 0;
@@ -614,6 +617,7 @@ export class DepthAnythingController {
   private framesSinceFps: number = 0;
   private currentFps: number = 0;
   private initialized: boolean = false;
+  private initPromise: Promise<void> | null = null;
   private currentBackend: 'webgpu' | 'wasm' | 'custom' = 'wasm';
   private pendingSbsRgba: Uint8Array | null = null;
   private pendingSbsWidth: number = 0;
@@ -621,9 +625,17 @@ export class DepthAnythingController {
   private pendingBaseDisp: number = 0;
   private pendingMaxDisp: number = 16;
   private frameStartTime: number = 0;
+  private videoCanvas: HTMLCanvasElement | OffscreenCanvas | null = null;
+  private videoCtx: CanvasRenderingContext2D | OffscreenCanvasRenderingContext2D | null = null;
 
-  constructor(options?: DepthAnythingControllerOptions) {
+  constructor(
+    options?: DepthAnythingControllerOptions,
+    onDepthMapReady?: DepthMapReadyCallback
+  ) {
     this.options = { ...options };
+    if (onDepthMapReady) {
+      this.options.onDepthMapReady = onDepthMapReady;
+    }
     if (options?.baseDisp !== undefined) this.baseDisp = options.baseDisp;
     if (options?.maxDisp !== undefined) this.maxDisp = options.maxDisp;
   }
@@ -656,65 +668,106 @@ export class DepthAnythingController {
     return this.currentBackend;
   }
 
+  public get sbsReconstructionMae(): number {
+    return this.lastTelemetry?.sbsReconstructionMae ?? 0;
+  }
+
+  public get scaleA(): number {
+    return this.lastTelemetry?.scaleA ?? 1;
+  }
+
+  public get shiftB(): number {
+    return this.lastTelemetry?.shiftB ?? 0;
+  }
+
+  public get anchorCount(): number {
+    return this.lastTelemetry?.anchorCount ?? 0;
+  }
+
+  public get inferenceTimeMs(): number {
+    return this.lastTelemetry?.inferenceTimeMs ?? 0;
+  }
+
+  public hasExternalDepthMap(): boolean {
+    return this.lastTelemetry !== null;
+  }
+
+  public getLastTelemetry(): DepthTelemetry | null {
+    return this.lastTelemetry;
+  }
+
   public async init(): Promise<void> {
     if (this.initialized) return;
+    if (this.initPromise) return this.initPromise;
 
-    if (this.options.customInfer) {
-      this.initialized = true;
-      this.currentBackend = 'custom';
-      return;
-    }
-
-    if (typeof Worker === 'undefined') {
-      console.warn('DepthAnythingController: Web Worker is unavailable in this environment');
-      this.initialized = true;
-      return;
-    }
-
-    try {
-      if (this.options.worker) {
-        this.worker = this.options.worker;
-      } else {
-        const workerUrl = this.options.workerUrl || new URL('./depthAnythingWorker.js', import.meta.url);
-        this.worker = new Worker(workerUrl, { type: 'module' });
+    this.initPromise = (async () => {
+      if (this.options.customInfer) {
+        this.initialized = true;
+        this.currentBackend = 'custom';
+        return;
       }
 
-      this.setupWorkerListeners();
+      if (typeof Worker === 'undefined') {
+        console.warn('DepthAnythingController: Web Worker is unavailable in this environment');
+        this.initialized = true;
+        return;
+      }
 
-      await new Promise<void>((resolve, reject) => {
-        const timeout = setTimeout(() => {
-          resolve(); // Don't block indefinitely on init
-        }, 10000);
+      try {
+        if (this.options.worker) {
+          this.worker = this.options.worker;
+        } else if (this.options.workerUrl) {
+          this.worker = new Worker(this.options.workerUrl, { type: 'module' });
+        } else {
+          this.worker = new Worker(new URL('./depthAnythingWorker.ts', import.meta.url), { type: 'module' });
+        }
 
-        const initHandler = (e: MessageEvent<WorkerOutMessage>) => {
-          if (e.data.type === 'initDone') {
-            clearTimeout(timeout);
-            this.currentBackend = e.data.backend;
-            this.initialized = true;
-            this.worker?.removeEventListener('message', initHandler);
-            resolve();
-          } else if (e.data.type === 'error') {
-            clearTimeout(timeout);
-            this.worker?.removeEventListener('message', initHandler);
-            reject(new Error(e.data.error));
-          }
-        };
+        this.setupWorkerListeners();
 
-        this.worker?.addEventListener('message', initHandler);
+        await new Promise<void>((resolve, reject) => {
+          const timeout = setTimeout(() => {
+            resolve(); // Don't block indefinitely on init
+          }, 15000);
 
-        const initMsg: WorkerInitMessage = {
-          type: 'init',
-          wasmPaths: this.options.wasmPaths || '/onnx-wasm/',
-          modelPath: this.options.modelPath || '/models/depthanythingv2.onnx',
-          modelPathWebGPU: this.options.modelPathWebGPU,
-          preferWebGPU: true,
-        };
-        this.worker?.postMessage(initMsg);
-      });
-    } catch (err) {
-      console.warn('DepthAnythingController init error:', err);
-      this.initialized = true;
-    }
+          const initHandler = (e: MessageEvent<WorkerOutMessage>) => {
+            if (e.data.type === 'initDone') {
+              clearTimeout(timeout);
+              this.currentBackend = e.data.backend;
+              this.initialized = true;
+              this.worker?.removeEventListener('message', initHandler);
+              resolve();
+            } else if (e.data.type === 'error') {
+              clearTimeout(timeout);
+              this.worker?.removeEventListener('message', initHandler);
+              reject(new Error(e.data.error));
+            }
+          };
+
+          this.worker?.addEventListener('message', initHandler);
+
+          const defaultWasmPaths = typeof window !== 'undefined'
+            ? new URL('./onnx-wasm/', window.location.href).href
+            : '/onnx-wasm/';
+          const defaultModelPath = typeof window !== 'undefined'
+            ? new URL('./models/depthanythingv2.onnx', window.location.href).href
+            : '/models/depthanythingv2.onnx';
+
+          const initMsg: WorkerInitMessage = {
+            type: 'init',
+            wasmPaths: this.options.wasmPaths || defaultWasmPaths,
+            modelPath: this.options.modelPath || defaultModelPath,
+            modelPathWebGPU: this.options.modelPathWebGPU,
+            preferWebGPU: true,
+          };
+          this.worker?.postMessage(initMsg);
+        });
+      } catch (err) {
+        console.warn('DepthAnythingController init error:', err);
+        this.initialized = true;
+      }
+    })();
+
+    return this.initPromise;
   }
 
   private setupWorkerListeners(): void {
@@ -747,6 +800,7 @@ export class DepthAnythingController {
       }
 
       // Step: Lock raw DepthAnything depth to real SBS stereo pair
+      const expandRadius = this.options.dilateRadius ?? this.options.expandRadius ?? 2;
       const calResult = calibrateDepthWithStereoSBS(
         result.rawDepth,
         sbsRgba,
@@ -755,7 +809,7 @@ export class DepthAnythingController {
         sbsWidth,
         sbsHeight,
         {
-          expandRadius: this.options.expandRadius ?? 2,
+          expandRadius,
           gradThreshold: this.options.gradThreshold ?? 12,
           step: this.options.step ?? 2,
         }
@@ -779,7 +833,10 @@ export class DepthAnythingController {
         backend: result.backend,
         fps: Math.round(this.currentFps * 10) / 10,
         frameId: result.frameId || this.frameCounter,
+        anchorCount: calResult.anchorCount,
       };
+
+      this.lastTelemetry = telemetry;
 
       this.options.onDepthMapReady?.(
         calResult.calibratedDepth,
@@ -791,6 +848,57 @@ export class DepthAnythingController {
       this.busy = false;
       this.pendingSbsRgba = null;
     }
+  }
+
+  /**
+   * Submits an SBS video element frame for async depth estimation and calibration.
+   * If already busy inferring a previous frame, returns false immediately (non-blocking).
+   */
+  public async processVideoFrame(
+    video: HTMLVideoElement,
+    baseDisp?: number,
+    maxDisp?: number
+  ): Promise<boolean> {
+    if (this.busy) {
+      return false;
+    }
+    if (!video || video.readyState < HTMLMediaElement.HAVE_CURRENT_DATA) {
+      return false;
+    }
+    const sbsW = video.videoWidth;
+    const sbsH = video.videoHeight;
+    if (!sbsW || !sbsH) {
+      return false;
+    }
+
+    if (!this.initialized && !this.initPromise) {
+      this.init().catch((e) => console.warn('DepthAnythingController auto-init error:', e));
+    }
+
+    if (!this.videoCanvas) {
+      if (typeof document !== 'undefined') {
+        this.videoCanvas = document.createElement('canvas');
+      } else if (typeof OffscreenCanvas !== 'undefined') {
+        this.videoCanvas = new OffscreenCanvas(sbsW, sbsH);
+      }
+    }
+    if (this.videoCanvas) {
+      if (this.videoCanvas.width !== sbsW || this.videoCanvas.height !== sbsH) {
+        this.videoCanvas.width = sbsW;
+        this.videoCanvas.height = sbsH;
+      }
+      if (!this.videoCtx) {
+        this.videoCtx = this.videoCanvas.getContext('2d', { willReadFrequently: true }) as any;
+      }
+    }
+    if (!this.videoCtx) {
+      return false;
+    }
+
+    this.videoCtx.drawImage(video, 0, 0, sbsW, sbsH);
+    const imgData = this.videoCtx.getImageData(0, 0, sbsW, sbsH);
+    const rawBytes = new Uint8Array(imgData.data.buffer, imgData.data.byteOffset, imgData.data.byteLength);
+    return this.processFrame(rawBytes, sbsW, sbsH, baseDisp, maxDisp);
   }
 
   /**
@@ -876,6 +984,9 @@ export class DepthAnythingController {
     }
     this.busy = false;
     this.initialized = false;
+    this.initPromise = null;
     this.pendingSbsRgba = null;
+    this.videoCanvas = null;
+    this.videoCtx = null;
   }
 }

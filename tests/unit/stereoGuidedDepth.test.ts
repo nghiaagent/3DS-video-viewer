@@ -1,7 +1,6 @@
-import { describe, it, expect, vi } from 'vitest';
+import { describe, it, expect } from 'vitest';
 import fs from 'node:fs';
 import path from 'node:path';
-import * as ort from 'onnxruntime-web';
 import {
   calibrateDepthWithStereoSBS,
   expandDepthMap,
@@ -11,8 +10,6 @@ import {
   DepthAnythingController,
 } from '../../src/depth/stereoGuidedDepth.js';
 import {
-  preprocessRgbaToPlanarTensor,
-  postprocessDepthTensor,
   initSession,
   runDepthInference,
 } from '../../src/depth/depthAnythingWorker.js';
@@ -327,7 +324,7 @@ describe('stereoGuidedDepth & DepthAnything Integration', () => {
         expect(w).toBe(eyeW);
         expect(h).toBe(eyeH);
       },
-      customInfer: async (_rgba, w, h) => {
+      customInfer: async (_rgba, _w, _h) => {
         // Mock worker returning normalized depth
         return {
           rawDepth: new Float32Array(trueDepthNorm),

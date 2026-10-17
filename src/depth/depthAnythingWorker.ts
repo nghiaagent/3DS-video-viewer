@@ -191,8 +191,14 @@ export async function initSession(options: {
   modelPathWebGPU?: string;
   preferWebGPU?: boolean;
 }): Promise<{ session: ort.InferenceSession; backend: 'webgpu' | 'wasm' }> {
-  const wasmPaths = options.wasmPaths || '/onnx-wasm/';
+  let wasmPaths = options.wasmPaths || '/onnx-wasm/';
   if (typeof wasmPaths === 'string') {
+    if (typeof self !== 'undefined' && self.location && !wasmPaths.startsWith('http://') && !wasmPaths.startsWith('https://')) {
+      wasmPaths = new URL(wasmPaths, self.location.origin + '/').href;
+    }
+    if (!wasmPaths.endsWith('/')) {
+      wasmPaths += '/';
+    }
     ort.env.wasm.wasmPaths = wasmPaths;
   } else {
     ort.env.wasm.wasmPaths = wasmPaths;
@@ -202,8 +208,15 @@ export async function initSession(options: {
     ort.env.wasm.numThreads = Math.min(4, navigator.hardwareConcurrency || 2);
   }
 
-  const modelPath = options.modelPath || '/models/depthanythingv2.onnx';
-  const modelPathWebGPU = options.modelPathWebGPU || options.modelPath;
+  let modelPath = options.modelPath || '/models/depthanythingv2.onnx';
+  if (typeof self !== 'undefined' && self.location && !modelPath.startsWith('http://') && !modelPath.startsWith('https://') && !modelPath.startsWith('blob:')) {
+    modelPath = new URL(modelPath, self.location.origin + '/').href;
+  }
+
+  let modelPathWebGPU = options.modelPathWebGPU || modelPath;
+  if (typeof self !== 'undefined' && self.location && modelPathWebGPU && !modelPathWebGPU.startsWith('http://') && !modelPathWebGPU.startsWith('https://') && !modelPathWebGPU.startsWith('blob:')) {
+    modelPathWebGPU = new URL(modelPathWebGPU, self.location.origin + '/').href;
+  }
 
   const hasWebGPU =
     options.preferWebGPU !== false &&

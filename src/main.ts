@@ -3,6 +3,7 @@ import { WebGLParallaxViewer, type RenderMode, type DisparityBackend, type Upsca
 import { MotionController } from './renderer/motionController.js';
 import { import3DSVideo, type VideoSource } from './importer/import3DSVideo.js';
 import { exportParallaxVideo, exportOfflineGPUVideo, type ExportFormat, type ExportMode } from './exporter/index.js';
+import { DepthAnythingController } from './depth/stereoGuidedDepth.js';
 
 // DOM Elements
 const canvas = document.getElementById('parallax-canvas') as HTMLCanvasElement;
@@ -69,6 +70,16 @@ const motionController = new MotionController(viewportContainer, {
   amplitude: 0.42,
 });
 
+const depthController = new DepthAnythingController(
+  { inputSize: 256, dilateRadius: 5 },
+  (calibratedDepth, width, height, _telemetry) => {
+    viewer.uploadExternalDepthMap(calibratedDepth, width, height);
+  }
+);
+depthController.init().catch((err) => {
+  console.warn('[DepthController] Init warning:', err);
+});
+
 let motionMode: 'auto' | 'interactive' | 'manual' = 'auto';
 let isSeeking = false;
 let isExporting = false;
@@ -96,6 +107,7 @@ function setImportProgress(stage: string, ratio: number) {
 // Load Video Helper
 async function loadVideo(source: VideoSource) {
   try {
+    viewer.clearExternalDepthMap();
     setImportProgress('Opening video...', 0.05);
     const result = await import3DSVideo(source, sourceVideo, (stage, ratio) => {
       setImportProgress(stage, ratio);
@@ -392,6 +404,10 @@ function renderLoop(timestampMs: number) {
   if (sourceVideo.readyState >= HTMLMediaElement.HAVE_CURRENT_DATA && !isExporting) {
     const verticalTilt = motionController.getVerticalTilt();
     viewer.renderVideoFrame(sourceVideo, viewShift, verticalTilt);
+
+    if (!depthController.isBusy()) {
+      depthController.processVideoFrame(sourceVideo, viewer.getBaseDisparity(), 16).catch(() => {});
+    }
   }
 
   // Update Telemetry if elements are queried by automated tests
@@ -411,6 +427,7 @@ requestAnimationFrame(renderLoop);
 // Expose on window for automated Playwright E2E tests and debugging
 (window as any).__viewerApp = {
   viewer,
+  depthController,
   videoElement: sourceVideo,
   motionController,
   spatialWindow,
@@ -419,6 +436,25 @@ requestAnimationFrame(renderLoop);
   exportOffline: (format: ExportFormat, options?: any) =>
     exportOfflineGPUVideo(format, viewer, sourceVideo, options),
   getTelemetry: () => viewer.getTelemetry(),
+  get lastTelemetry() {
+    return depthController.lastTelemetry;
+  },
+  get sbsReconstructionMae() {
+    return depthController.sbsReconstructionMae;
+  },
+  get scaleA() {
+    return depthController.scaleA;
+  },
+  get shiftB() {
+    return depthController.shiftB;
+  },
+  get anchorCount() {
+    return depthController.anchorCount;
+  },
+  get inferenceTimeMs() {
+    return depthController.inferenceTimeMs;
+  },
+  hasExternalDepthMap: () => viewer.hasExternalDepthMap(),
   setMotionMode: (mode: 'auto' | 'interactive' | 'manual') => {
     motionMode = mode;
     motionModeSelect.value = mode;
