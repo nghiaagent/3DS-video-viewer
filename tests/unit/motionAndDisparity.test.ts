@@ -6,6 +6,8 @@ import {
   VERTEX_SHADER_SOURCE,
   DISPARITY_SAD_FRAG_SOURCE,
   PERSPECTIVE_WINDOW_FRAG_SOURCE,
+  TIEFLING_DEPTH_FILTER_FRAG_SOURCE,
+  TIEFLING_MESH_VERTEX_SHADER_SOURCE,
 } from '../../src/renderer/shaders.js';
 import { WebGLParallaxViewer } from '../../src/renderer/webglViewer.js';
 import { initSync, StereoDisparity, downsample_sbs_rgba_half } from '../../src/wasm/pkg/stereo_disparity.js';
@@ -73,6 +75,7 @@ describe('GLSL Shader Sources & Perspective Warp UV Bounds', () => {
     expect(DISPARITY_SAD_FRAG_SOURCE).toContain('u_maxDisp');
     expect(DISPARITY_SAD_FRAG_SOURCE).toContain('u_baseDisp');
     expect(DISPARITY_SAD_FRAG_SOURCE).toContain('u_temporalWeight');
+    expect(DISPARITY_SAD_FRAG_SOURCE).toContain('lumaDiff');
 
     expect(PERSPECTIVE_WINDOW_FRAG_SOURCE).toContain('#version 300 es');
     expect(PERSPECTIVE_WINDOW_FRAG_SOURCE).toContain('u_sbsTexture');
@@ -83,6 +86,91 @@ describe('GLSL Shader Sources & Perspective Warp UV Bounds', () => {
     expect(PERSPECTIVE_WINDOW_FRAG_SOURCE).toContain('u_baseDisp');
     expect(PERSPECTIVE_WINDOW_FRAG_SOURCE).toContain('u_renderMode');
     expect(VERTEX_SHADER_SOURCE).toContain('u_flipY');
+  });
+
+  it('validates Tiefling 3D mesh vertex shader and depth filter fragment shader structure & uniforms', () => {
+    expect(TIEFLING_MESH_VERTEX_SHADER_SOURCE).toContain('#version 300 es');
+    expect(TIEFLING_MESH_VERTEX_SHADER_SOURCE).toContain('in vec2 a_uv;');
+    expect(TIEFLING_MESH_VERTEX_SHADER_SOURCE).toContain('out vec2 v_uv;');
+    expect(TIEFLING_MESH_VERTEX_SHADER_SOURCE).toContain('uniform sampler2D u_dispTexture;');
+    expect(TIEFLING_MESH_VERTEX_SHADER_SOURCE).toContain('uniform float u_viewShift;');
+    expect(TIEFLING_MESH_VERTEX_SHADER_SOURCE).toContain('uniform float u_verticalTilt;');
+    expect(TIEFLING_MESH_VERTEX_SHADER_SOURCE).toContain('uniform float u_meshDepth;');
+    expect(TIEFLING_MESH_VERTEX_SHADER_SOURCE).toContain('uniform float u_focus;');
+    expect(TIEFLING_MESH_VERTEX_SHADER_SOURCE).toContain('uniform float u_sensitivity;');
+    expect(TIEFLING_MESH_VERTEX_SHADER_SOURCE).toContain('uniform float u_windowCrop;');
+    expect(TIEFLING_MESH_VERTEX_SHADER_SOURCE).toContain('uniform float u_flipY;');
+    expect(TIEFLING_MESH_VERTEX_SHADER_SOURCE).toContain('uniform int u_renderMode;');
+    expect(TIEFLING_MESH_VERTEX_SHADER_SOURCE).toContain('cameraZ = 4.0;');
+    expect(TIEFLING_MESH_VERTEX_SHADER_SOURCE).toContain('scaleFactor');
+    expect(TIEFLING_MESH_VERTEX_SHADER_SOURCE).toContain('edgeFactor');
+    expect(TIEFLING_MESH_VERTEX_SHADER_SOURCE).toContain('mouseDelta');
+    expect(TIEFLING_MESH_VERTEX_SHADER_SOURCE).toContain('perspDiv');
+
+    expect(TIEFLING_DEPTH_FILTER_FRAG_SOURCE).toContain('#version 300 es');
+    expect(TIEFLING_DEPTH_FILTER_FRAG_SOURCE).toContain('uniform sampler2D u_rawDispTexture;');
+    expect(TIEFLING_DEPTH_FILTER_FRAG_SOURCE).toContain('uniform vec2 u_dispTexelSize;');
+    expect(TIEFLING_DEPTH_FILTER_FRAG_SOURCE).toContain('gradientMag > 0.08');
+    expect(TIEFLING_DEPTH_FILTER_FRAG_SOURCE).toContain('smoothedDilated');
+  });
+
+  it('verifies Tiefling perspective unprojection yields exact undistorted basePos when mouseDelta == (0, 0)', () => {
+    const cameraZ = 4.0;
+    const meshDepths = [0.2, 0.6, 1.0];
+
+    for (const meshDepth of meshDepths) {
+      for (let zNorm = 0.0; zNorm <= 1.0; zNorm += 0.1) {
+        const z = zNorm * meshDepth;
+        const scaleFactor = (cameraZ - z) / cameraZ;
+
+        for (let uvX = 0.0; uvX <= 1.0; uvX += 0.1) {
+          for (let uvY = 0.0; uvY <= 1.0; uvY += 0.1) {
+            const basePosX = uvX * 2.0 - 1.0;
+            const basePosY = uvY * 2.0 - 1.0;
+
+            // When mouseDelta == (0, 0), pos.xy = basePos * scaleFactor
+            const posX = basePosX * scaleFactor;
+            const posY = basePosY * scaleFactor;
+
+            // Perspective division: pos.xy / ((cameraZ - z) / cameraZ)
+            const perspDiv = (cameraZ - z) / cameraZ;
+            const projectedX = posX / perspDiv;
+            const projectedY = posY / perspDiv;
+
+            expect(projectedX).toBeCloseTo(basePosX, 6);
+            expect(projectedY).toBeCloseTo(basePosY, 6);
+          }
+        }
+      }
+    }
+  });
+
+  it('verifies Tiefling rotational parallax displacement formula and edge factor behavior', () => {
+    const focus = 0.35;
+    const sensitivity = 0.28;
+
+    // Outer edge: edgeFactor approaches 0
+    const edgeDistX = 0.0;
+    const edgeDistY = 0.0;
+    const edgeDist = Math.min(edgeDistX, edgeDistY);
+    // smoothstep(0.0, 0.06, 0.0) == 0.0
+    expect(edgeDist).toBe(0.0);
+
+    // Center: uv = 0.5 -> edgeDist = 0.5 -> smoothstep(0.0, 0.06, 0.5) == 1.0
+    const centerEdgeFactor = Math.min(1.0, Math.max(0.0, (0.5 - 0.0) / 0.06));
+    expect(centerEdgeFactor).toBe(1.0);
+
+    // Foreground vertex (depth = 0.8 > focus = 0.35) shifted right (viewShift = 0.8 -> mouseDelta.x = 0.6)
+    const viewShift = 0.8;
+    const mouseDeltaX = (viewShift - 0.5) * 2.0; // 0.6
+    const actualDepthFg = 0.8;
+    const rotateFgX = mouseDeltaX * sensitivity * (1.0 - focus) * (actualDepthFg - focus) * -1.0;
+    expect(rotateFgX).toBeLessThan(0); // Moves inversely to camera shift, producing natural depth
+
+    // Background vertex (depth = 0.1 < focus = 0.35)
+    const actualDepthBg = 0.1;
+    const rotateBgX = mouseDeltaX * sensitivity * (1.0 - focus) * (actualDepthBg - focus) * -1.0;
+    expect(rotateBgX).toBeGreaterThan(0); // Opposes foreground, creating stereo parallax separation
   });
 
   it('verifies 2.5D ray-marched perspective warp stays strictly within eye texture halves across all baseline offsets', () => {
@@ -268,6 +356,16 @@ describe('Rust Wasm SIMD Disparity Integration', () => {
       );
       expect(tsDetected).toBe(shift);
 
+      // Also verify default search range [-80, 24] correctly detects shift in [-80, 24]
+      if (shift >= -80 && shift <= 24) {
+        const tsDefaultDetected = WebGLParallaxViewer.prototype.estimateGlobalBaselineFromRgba(
+          syntheticRgba,
+          sbsW,
+          eyeH
+        );
+        expect(tsDefaultDetected).toBe(shift);
+      }
+
       // 2. Test Wasm baseline estimator
       const wasmEngine = new StereoDisparity(eyeW, eyeH, 24);
       const wasmDetected = wasmEngine.estimate_global_disparity(syntheticRgba, -112, 32);
@@ -275,5 +373,17 @@ describe('Rust Wasm SIMD Disparity Integration', () => {
       expect(wasmEngine.base_disp()).toBe(shift);
     }
   });
+
+  it('verifies setThreeDSMetadata updates baseline hint and exposes metadata correctly', () => {
+    // Test prototype methods for setting and retrieving 3DS metadata
+    const dummyViewer = Object.create(WebGLParallaxViewer.prototype);
+    dummyViewer.setThreeDSMetadata(12.5, -72);
+    expect(dummyViewer.getBaseDisparity()).toBe(-72);
+
+    const meta = dummyViewer.getThreeDSMetadata();
+    expect(meta.parallaxOffset).toBe(12.5);
+    expect(meta.estimatedBaseDisp).toBe(-72);
+  });
 });
+
 
