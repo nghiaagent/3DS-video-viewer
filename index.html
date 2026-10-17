@@ -73,8 +73,8 @@
           <span id="progress-percent" style="font-family: var(--font-mono); font-weight: 700;">0%</span>
         </div>
 
-        <!-- Hidden Source Video -->
-        <video id="source-video" playsinline crossOrigin="anonymous" style="display: none;"></video>
+        <!-- Offscreen Source Video (active for WebGL texture decoding) -->
+        <video id="source-video" playsinline muted loop crossOrigin="anonymous" style="position: fixed; top: 0; left: 0; width: 4px; height: 4px; opacity: 0.001; pointer-events: none;"></video>
 
         <!-- Transport Bar -->
         <div class="transport-bar">

@@ -15,6 +15,7 @@ export interface DisparityResult {
 
 export class WasmDisparityEngine {
   private static instance: WasmDisparityEngine | null = null;
+  private static initPromise: Promise<WasmDisparityEngine> | null = null;
   private isInitialized = false;
 
   private halfResEngine: StereoDisparity | null = null;
@@ -25,17 +26,24 @@ export class WasmDisparityEngine {
   private ctx: CanvasRenderingContext2D | OffscreenCanvasRenderingContext2D | null = null;
 
   public static async getInstance(): Promise<WasmDisparityEngine> {
-    if (!WasmDisparityEngine.instance) {
-      WasmDisparityEngine.instance = new WasmDisparityEngine();
-      await WasmDisparityEngine.instance.init();
+    if (WasmDisparityEngine.instance) {
+      return WasmDisparityEngine.instance;
     }
-    return WasmDisparityEngine.instance;
+    if (!WasmDisparityEngine.initPromise) {
+      WasmDisparityEngine.initPromise = (async () => {
+        const inst = new WasmDisparityEngine();
+        await inst.init();
+        WasmDisparityEngine.instance = inst;
+        return inst;
+      })();
+    }
+    return WasmDisparityEngine.initPromise;
   }
 
   public async init(): Promise<void> {
     if (this.isInitialized) return;
 
-    await initWasm(wasmUrl);
+    await initWasm({ module_or_path: wasmUrl });
 
     // Default 3DS resolutions:
     // Full resolution: 480x240 per eye (960x240 SBS), max_disp = 24

@@ -3,7 +3,7 @@ import { WebGLParallaxViewer, type RenderMode, type DisparityBackend, type Upsca
 import { MotionController } from './renderer/motionController.js';
 import { import3DSVideo, type VideoSource } from './importer/import3DSVideo.js';
 import { fetchDcimList, fetchBundledManifest, formatBytes } from './importer/dcimCatalog.js';
-import { exportParallaxVideo, type ExportFormat, type ExportMode } from './exporter/index.js';
+import { exportParallaxVideo, exportOfflineGPUVideo, type ExportFormat, type ExportMode } from './exporter/index.js';
 
 // DOM Elements
 const canvas = document.getElementById('parallax-canvas') as HTMLCanvasElement;
@@ -109,9 +109,14 @@ async function loadVideo(source: VideoSource) {
     });
     console.log('[ViewerApp] Loaded video:', result.filename, result.format);
   } catch (err: unknown) {
-    setImportProgress('Error loading video', 1.0);
     const msg = err instanceof Error ? err.message : String(err);
-    alert(`Failed to load video: ${msg}`);
+    console.error('[ViewerApp] Failed to load video:', msg);
+    progressBanner.style.display = 'flex';
+    progressStatusText.textContent = `Error: ${msg}`;
+    progressPercent.textContent = '!';
+    setTimeout(() => {
+      progressBanner.style.display = 'none';
+    }, 5000);
   }
 }
 
@@ -365,8 +370,12 @@ async function populateCatalog() {
 
 refreshDcimBtn.addEventListener('click', populateCatalog);
 
+let isLoopRunning = true;
+
 // Main Animation & Parallax Render Loop (60 FPS)
 function renderLoop(timestampMs: number) {
+  if (!isLoopRunning) return;
+
   let viewShift = 0.5;
 
   if (motionMode === 'manual') {
@@ -417,9 +426,28 @@ loadVideo({
   motionController,
   importVideo: loadVideo,
   exportVideo: triggerExport,
+  exportOffline: (format: ExportFormat, options?: any) =>
+    exportOfflineGPUVideo(format, viewer, sourceVideo, options),
   getTelemetry: () => viewer.getTelemetry(),
   setMotionMode: (mode: 'auto' | 'interactive' | 'manual') => {
     motionMode = mode;
     motionModeSelect.value = mode;
+  },
+  setManualShift: (shift: number) => {
+    motionMode = 'manual';
+    motionModeSelect.value = 'manual';
+    manualShiftGroup.style.display = 'flex';
+    manualShiftSlider.value = String(shift);
+    manualShiftVal.textContent = shift.toFixed(2);
+    motionController.setManualShift(shift);
+  },
+  pauseRenderLoop: () => {
+    isLoopRunning = false;
+  },
+  resumeRenderLoop: () => {
+    if (!isLoopRunning) {
+      isLoopRunning = true;
+      requestAnimationFrame(renderLoop);
+    }
   },
 };

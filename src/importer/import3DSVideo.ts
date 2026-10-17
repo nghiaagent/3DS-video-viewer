@@ -1,5 +1,5 @@
 import { FFmpeg } from '@ffmpeg/ffmpeg';
-import { fetchFile } from '@ffmpeg/util';
+import { fetchFile, toBlobURL } from '@ffmpeg/util';
 
 export interface VideoSourceInput {
   url: string;
@@ -30,10 +30,10 @@ export async function getFFmpeg(onProgress?: (progress: number) => void): Promis
       }
     });
 
-    // Core files placed in public/ffmpeg/ for reliable same-origin loading
+    const baseURL = `${window.location.origin}/ffmpeg`;
     await ffmpeg.load({
-      coreURL: './ffmpeg/ffmpeg-core.js',
-      wasmURL: './ffmpeg/ffmpeg-core.wasm',
+      coreURL: await toBlobURL(`${baseURL}/ffmpeg-core.js`, 'text/javascript'),
+      wasmURL: await toBlobURL(`${baseURL}/ffmpeg-core.wasm`, 'application/wasm'),
     });
 
     ffmpegInstance = ffmpeg;
@@ -53,7 +53,21 @@ export async function import3DSVideo(
   onProgress?: (stage: string, ratio: number) => void
 ): Promise<{ filename: string; format: 'sbs_mp4' | 'sbs_webm' | 'transcoded_avi'; objectUrl: string }> {
   const fileName = source instanceof File ? source.name : source.name;
-  const ext = fileName.toLowerCase().split('.').pop() || '';
+  let ext = '';
+  if (source instanceof File) {
+    ext = source.name.toLowerCase().split('.').pop() || '';
+  } else {
+    const rawUrl = source.url.split('?')[0].toLowerCase();
+    const urlExt = rawUrl.split('.').pop() || '';
+    const nameExt = source.name.toLowerCase().split('.').pop() || '';
+    if (['mp4', 'webm', 'avi', 'mpo'].includes(urlExt)) {
+      ext = urlExt;
+    } else if (['mp4', 'webm', 'avi', 'mpo'].includes(nameExt)) {
+      ext = nameExt;
+    } else {
+      ext = urlExt || nameExt;
+    }
+  }
 
   // 1. FAST PATH: Standard Side-by-Side MP4 or WebM
   if (ext === 'mp4' || ext === 'webm') {
