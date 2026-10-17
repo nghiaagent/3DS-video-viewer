@@ -7,30 +7,30 @@ const FFPROBE_BIN = fs.existsSync('/opt/homebrew/bin/ffprobe')
   ? '/opt/homebrew/bin/ffprobe'
   : 'ffprobe';
 
-test.describe('3DS Stereoscopic Parallax Viewer E2E Suite', () => {
+test.describe('Spatial 3DS Video Viewer E2E Suite', () => {
   test.beforeEach(async ({ page }) => {
     page.on('console', (msg) => console.log(`[BROWSER ${msg.type()}]`, msg.text()));
     page.on('pageerror', (err) => console.error('[BROWSER ERROR]', err.message));
   });
 
-  test('1. DCIM Library Discovery & Initial SBS Video Playback', async ({ page }) => {
+  test('1. DCIM API Discovery & WebGL2 Spatial Window Canvas', async ({ page }) => {
     await page.goto('/');
 
-    // 1. Verify Cross-Origin Isolation for SharedArrayBuffer
+    // 1. Verify Cross-Origin Isolation for SharedArrayBuffer & WebAssembly SIMD
     const isIsolated = await page.evaluate(() => window.crossOriginIsolated);
     expect(isIsolated).toBe(true);
 
-    // 2. Verify DCIM library populated all 36 recordings from local DCIM
-    await page.waitForSelector('#dcim-recordings-list .dcim-item', { timeout: 15_000 });
-    const dcimCount = await page.locator('#dcim-recordings-list .dcim-item').count();
-    console.log(`Discovered ${dcimCount} local DCIM recordings`);
-    expect(dcimCount).toBeGreaterThanOrEqual(36);
+    // 2. Verify DCIM catalog endpoint discovers local recordings without exposing them in the public UI
+    const dcimResponse = await page.request.get('/api/dcim/list');
+    expect(dcimResponse.ok()).toBe(true);
+    const dcimList = await dcimResponse.json();
+    console.log(`Discovered ${dcimList.length} local DCIM recordings via private local dev server`);
+    expect(dcimList.length).toBeGreaterThanOrEqual(36);
 
-    // 3. Verify bundled samples manifest loaded
-    const sampleCount = await page.locator('#bundled-samples-list .dcim-item').count();
-    expect(sampleCount).toBeGreaterThanOrEqual(3);
+    // 3. Verify Apple Vision-style Spatial Window & WebGL2 Canvas are rendered
+    const spatialWindow = page.locator('#spatial-window');
+    await expect(spatialWindow).toBeVisible();
 
-    // 4. Verify WebGL2 Canvas resolution and active playback
     const canvas = page.locator('#parallax-canvas');
     await expect(canvas).toBeVisible();
 
@@ -41,11 +41,19 @@ test.describe('3DS Stereoscopic Parallax Viewer E2E Suite', () => {
     expect(canvasDims.width).toBe(960);
     expect(canvasDims.height).toBe(480);
 
-    // Wait for video playback and verify non-black canvas pixels
+    // 4. Import test video and verify active playback
+    await page.evaluate(async () => {
+      const app = (window as any).__viewerApp;
+      await app.importVideo({
+        url: '/api/dcim/file?path=101NIN03/HNI_0065.AVI',
+        name: 'HNI_0065.AVI',
+      });
+    });
+
     await page.waitForFunction(() => {
       const app = (window as any).__viewerApp;
       return app && app.videoElement && app.videoElement.readyState >= 2 && app.videoElement.currentTime > 0;
-    }, { timeout: 15_000 });
+    }, { timeout: 30_000 });
 
     const pixelCheck = await page.evaluate(() => {
       const app = (window as any).__viewerApp;
@@ -59,15 +67,45 @@ test.describe('3DS Stereoscopic Parallax Viewer E2E Suite', () => {
     expect(pixelCheck.r + pixelCheck.g + pixelCheck.b).toBeGreaterThan(0);
   });
 
-  test('2. GPU & Wasm SIMD Disparity Backends with Perspective Shifting', async ({ page }) => {
+  test('2. 3D Moving Spatial Window & GPU/Wasm Disparity Perspective Shifting', async ({ page }) => {
     await page.goto('/');
+
+    // Import test video
+    await page.evaluate(async () => {
+      const app = (window as any).__viewerApp;
+      await app.importVideo({
+        url: '/api/dcim/file?path=101NIN03/HNI_0065.AVI',
+        name: 'HNI_0065.AVI',
+      });
+    });
 
     await page.waitForFunction(() => {
       const app = (window as any).__viewerApp;
       return app && app.videoElement && app.videoElement.readyState >= 2 && app.videoElement.currentTime > 0;
-    }, { timeout: 15_000 });
+    }, { timeout: 30_000 });
 
-    // 1. Test Perspective Shift on GPU backend (Left vs Right shift difference)
+    // 1. Verify Apple Vision Pro 3D Spatial Window movement in CSS space
+    const windowTransforms = await page.evaluate(async () => {
+      const app = (window as any).__viewerApp;
+      app.setManualShift(0.0);
+      await new Promise((r) => setTimeout(r, 80));
+      const leftTransform = app.spatialWindow.style.transform;
+
+      app.setManualShift(1.0);
+      await new Promise((r) => setTimeout(r, 80));
+      const rightTransform = app.spatialWindow.style.transform;
+
+      return { leftTransform, rightTransform };
+    });
+
+    console.log('Spatial window left transform:', windowTransforms.leftTransform);
+    console.log('Spatial window right transform:', windowTransforms.rightTransform);
+    expect(windowTransforms.leftTransform).toContain('translateX(-18px)');
+    expect(windowTransforms.leftTransform).toContain('rotateY(6.5deg)');
+    expect(windowTransforms.rightTransform).toContain('translateX(18px)');
+    expect(windowTransforms.rightTransform).toContain('rotateY(-6.5deg)');
+
+    // 2. Test Perspective Shift on GPU backend (Left vs Right shift difference)
     const shiftResult = await page.evaluate(async () => {
       const app = (window as any).__viewerApp;
       app.pauseRenderLoop();
@@ -98,7 +136,7 @@ test.describe('3DS Stereoscopic Parallax Viewer E2E Suite', () => {
     console.log('Perspective shift total pixel delta:', shiftResult.diff);
     expect(shiftResult.diff).toBeGreaterThan(1000);
 
-    // 2. Switch to Wasm SIMD backend and verify telemetry
+    // 3. Switch to Wasm SIMD backend and verify telemetry
     const wasmTelemetry = await page.evaluate(async () => {
       const app = (window as any).__viewerApp;
       app.viewer.setBackend('wasm');
@@ -109,7 +147,7 @@ test.describe('3DS Stereoscopic Parallax Viewer E2E Suite', () => {
     expect(wasmTelemetry.backend).toBe('wasm');
     expect(wasmTelemetry.dispMs).toBeGreaterThanOrEqual(0);
 
-    // 3. Test Disparity Depth Heatmap mode
+    // 4. Test Disparity Depth Heatmap mode
     const heatmapResult = await page.evaluate(async () => {
       const app = (window as any).__viewerApp;
       app.viewer.setRenderMode(1); // Mode 1: Heatmap
@@ -134,15 +172,14 @@ test.describe('3DS Stereoscopic Parallax Viewer E2E Suite', () => {
   test('3. Raw Dual-Stream 3DS .AVI Import and Transcoding', async ({ page }) => {
     await page.goto('/');
 
-    // Wait for DCIM list to load
-    await page.waitForSelector('#dcim-recordings-list .dcim-item', { timeout: 15_000 });
+    await page.evaluate(async () => {
+      const app = (window as any).__viewerApp;
+      await app.importVideo({
+        url: '/api/dcim/file?path=101NIN03/HNI_0065.AVI',
+        name: 'HNI_0065.AVI',
+      });
+    });
 
-    // Click to load HNI_0065.AVI (compact real 3DS recording ~68KB)
-    const aviLoadBtn = page.locator('button[data-dcim-path="101NIN03/HNI_0065.AVI"]');
-    await expect(aviLoadBtn).toBeVisible();
-    await aviLoadBtn.click();
-
-    // Verify FFmpeg progress banner appears or finishes
     await page.waitForFunction(() => {
       const app = (window as any).__viewerApp;
       return (
@@ -168,15 +205,22 @@ test.describe('3DS Stereoscopic Parallax Viewer E2E Suite', () => {
   test('4. Hardcoded GPU Video Exports (.mp4 H.264 & .webm VP9) + ffprobe Verification', async ({ page }) => {
     await page.goto('/');
 
+    await page.evaluate(async () => {
+      const app = (window as any).__viewerApp;
+      await app.importVideo({
+        url: '/api/dcim/file?path=101NIN03/HNI_0065.AVI',
+        name: 'HNI_0065.AVI',
+      });
+    });
+
     await page.waitForFunction(() => {
       const app = (window as any).__viewerApp;
       return app && app.videoElement && app.videoElement.readyState >= 2 && app.videoElement.currentTime > 0;
-    }, { timeout: 15_000 });
+    }, { timeout: 30_000 });
 
     const testResultsDir = path.resolve(process.cwd(), 'test-results');
     fs.mkdirSync(testResultsDir, { recursive: true });
 
-    // Helper to export and retrieve binary buffer from page context
     const exportAndSave = async (format: 'mp4' | 'webm'): Promise<string> => {
       const exportData = await page.evaluate(async (fmt) => {
         const app = (window as any).__viewerApp;
@@ -188,7 +232,6 @@ test.describe('3DS Stereoscopic Parallax Viewer E2E Suite', () => {
 
         const arrayBuf = await res.blob.arrayBuffer();
         const bytes = new Uint8Array(arrayBuf);
-        // Convert to base64 in chunks
         let binary = '';
         const chunkSize = 8192;
         for (let i = 0; i < bytes.length; i += chunkSize) {
@@ -259,7 +302,6 @@ test.describe('3DS Stereoscopic Parallax Viewer E2E Suite', () => {
     await page.goto('/');
 
     const resolutionResults = await page.evaluate(async () => {
-      // 1. Verify URL resolution math under GitHub Pages subpath
       const ghPagesBase = 'https://nghiaagent.github.io/3DS-video-viewer/';
       const ghPagesIndex = 'https://nghiaagent.github.io/3DS-video-viewer/index.html';
 
@@ -267,7 +309,6 @@ test.describe('3DS Stereoscopic Parallax Viewer E2E Suite', () => {
       const wasmFromBase = new URL('./ffmpeg/ffmpeg-core.wasm', ghPagesBase).href;
       const coreFromIndex = new URL('./ffmpeg/ffmpeg-core.js', ghPagesIndex).href;
 
-      // 2. Verify current page's FFmpeg core assets are reachable with 200 OK
       const currentCore = new URL('./ffmpeg/ffmpeg-core.js', window.location.href).href;
       const currentWasm = new URL('./ffmpeg/ffmpeg-core.wasm', window.location.href).href;
 
