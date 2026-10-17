@@ -680,7 +680,7 @@ export class WebGLParallaxViewer {
   }
 
   /**
-   * Upload an external depth map (e.g. from DepthAnythingV2/V3) to the GPU.
+   * Upload an external depth map (e.g. from DepthAnything V3) to the GPU.
    * Format: Uint8Array of length (width * height), values 0..255.
    * Optimized with zero-reallocation gl.texSubImage2D (< 0.02 ms at 60 FPS).
    */

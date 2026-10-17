@@ -117,8 +117,15 @@ void main() {
     vec2 sampleUV = clamp(vec2(u_windowCrop + uv.x * (1.0 - 2.0 * u_windowCrop), uv.y), 0.0, 1.0);
     float depth;
     if (u_dispTexelSize.x < 0.005) {
-        // High-resolution DepthAnything V2 / V3: tight 1-texel sample preserving razor-sharp silhouettes
+        // High-resolution DepthAnything V3: edge-aware foreground-preserving 5-tap filter at ±0.75 texel offsets
         depth = texture(u_dispTexture, sampleUV).r;
+        float dCenter = depth;
+        vec2 off = u_dispTexelSize * 0.75;
+        float dL = texture(u_dispTexture, clamp(sampleUV - vec2(off.x, 0.0), 0.0, 1.0)).r;
+        float dR = texture(u_dispTexture, clamp(sampleUV + vec2(off.x, 0.0), 0.0, 1.0)).r;
+        float dU = texture(u_dispTexture, clamp(sampleUV + vec2(0.0, off.y), 0.0, 1.0)).r;
+        float dD = texture(u_dispTexture, clamp(sampleUV - vec2(0.0, off.y), 0.0, 1.0)).r;
+        depth = mix(dCenter, max(dCenter, max(max(dL, dR), max(dU, dD))), 0.35);
     } else {
         // Fallback coarse disparity 5-tap smooth sample
         float dC = texture(u_dispTexture, sampleUV).r;
@@ -421,9 +428,19 @@ void main() {
     );
 
     // Mode 0: Tiefling 3D Parallax Mesh mode
-    // Samples ONLY the single converged Left Eye color stream (clean, ghost-free, jump-free)
+    // Blends Left Eye and Right Eye using photometric agreement and local stereo disparity
     if (u_renderMode == 0) {
         vec3 colorL = texture(u_sbsTexture, vec2(eyeUV.x * 0.5, eyeUV.y)).rgb;
+
+        float dVal = texture(u_dispTexture, eyeUV).r;
+        float baseDispPx = float(u_baseDisp);
+        float rightEyeX = clamp(eyeUV.x - (baseDispPx + (dVal - 0.35) * 28.0) * u_eyeTexelSize.x, 0.002, 0.998);
+        vec3 colorR = texture(u_sbsTexture, vec2(0.5 + rightEyeX * 0.5, eyeUV.y)).rgb;
+
+        float colorDiff = length(colorL - colorR);
+        float stereoAgreement = exp(-colorDiff * colorDiff * 18.0);
+        float rightBlend = smoothstep(0.35, 0.85, u_viewShift) * stereoAgreement * 0.65;
+        vec3 stereoColor = mix(colorL, colorR, rightBlend);
 
         // Subtle rounded corner portal mask (cornerRadius = 0.025)
         vec2 edgeDist = min(v_uv, 1.0 - v_uv);
@@ -436,7 +453,7 @@ void main() {
         float rimDist = min(edgeDist.x, edgeDist.y);
         float frameAlpha = smoothstep(0.0, 0.008, rimDist);
 
-        outColor = vec4(colorL * portalMask * frameAlpha, 1.0);
+        outColor = vec4(stereoColor * portalMask * frameAlpha, 1.0);
         return;
     }
 
@@ -444,7 +461,7 @@ void main() {
     if (u_renderMode == 1) {
         float dVal;
         if (u_dispTexelSize.x < 0.005) {
-            // Full-resolution DepthAnything V2 / V3: preserve razor-sharp edges without blur
+            // Full-resolution DepthAnything V3: preserve razor-sharp edges without blur
             dVal = texture(u_dispTexture, eyeUV).r;
         } else {
             // Fallback coarse disparity: 5-tap smooth sample

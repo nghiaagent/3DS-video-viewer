@@ -34,8 +34,6 @@ const exportModeSelect = document.getElementById('export-mode-select') as HTMLSe
 
 const backendSelect = document.getElementById('backend-select') as HTMLSelectElement | null;
 const renderModeSelect = document.getElementById('render-mode-select') as HTMLSelectElement;
-const modelV2Btn = document.getElementById('model-v2-btn') as HTMLButtonElement | null;
-const modelV3Btn = document.getElementById('model-v3-btn') as HTMLButtonElement | null;
 const upscaleSelect = document.getElementById('upscale-select') as HTMLSelectElement | null;
 const motionModeSelect = document.getElementById('motion-mode-select') as HTMLSelectElement;
 
@@ -73,7 +71,7 @@ const motionController = new MotionController(viewportContainer, {
 });
 
 const depthController = new DepthAnythingController(
-  { modelVersion: 'v3', inputSize: 504, expandRadius: 1, dilateRadius: 1 },
+  { modelVersion: 'v3', inputSize: 392, expandRadius: 1, dilateRadius: 1 },
   (calibratedDepth, width, height, _telemetry) => {
     viewer.uploadExternalDepthMap(calibratedDepth, width, height);
   }
@@ -84,14 +82,14 @@ depthController.init().catch((err) => {
 
 let videoDepthTimeline: VideoDepthTimeline = new VideoDepthTimeline({
   fps: 20,
-  inputSize: 336,
+  inputSize: 392,
 });
 depthController.setTimeline(videoDepthTimeline);
 
 // Register frame-accurate synchronous depth provider (0.0 ms desync)
 viewer.setDepthProvider((timeSec: number) => {
   if (!videoDepthTimeline) return null;
-  const depth = videoDepthTimeline.getDepthAtTime(timeSec, depthController.getModelVersion());
+  const depth = videoDepthTimeline.getDepthAtTime(timeSec, 'v3');
   if (depth) {
     return { depth, width: 480, height: 240 };
   }
@@ -163,13 +161,13 @@ async function loadVideo(source: LoadVideoSource, displayName?: string) {
     }
     console.log('[ViewerApp] Loaded video:', result.filename, result.format, result.metadata);
 
-    // Initial timeline pre-computation across video stream for BOTH V3 and V2
+    // Initial timeline pre-computation across video stream for V3
     if (videoDepthTimeline) {
       videoDepthTimeline.destroy();
     }
     videoDepthTimeline = new VideoDepthTimeline({
       fps: 20,
-      inputSize: 336,
+      inputSize: 392,
       baseDisp: viewer.getBaseDisparity() ?? 0,
     });
     depthController.setTimeline(videoDepthTimeline);
@@ -177,7 +175,7 @@ async function loadVideo(source: LoadVideoSource, displayName?: string) {
     const isE2E =
       typeof navigator !== 'undefined' &&
       (Boolean((navigator as any).webdriver) || /HeadlessChrome/.test(navigator.userAgent));
-    const initialKeyframes = isE2E ? 2 : 6;
+    const initialKeyframes = isE2E ? 2 : 12;
     const timelineTimeoutMs = isE2E ? 12_000 : 30_000;
 
     await Promise.race([
@@ -185,7 +183,8 @@ async function loadVideo(source: LoadVideoSource, displayName?: string) {
         sourceVideo,
         viewer.getBaseDisparity(),
         (stage, ratio) => {
-          setImportProgress(stage, ratio);
+          const displayStage = stage.includes('Analyzing') ? 'Analyzing 3D stereo depth (V3)...' : stage;
+          setImportProgress(displayStage, ratio);
         },
         {
           initialKeyframes,
@@ -306,47 +305,6 @@ renderModeSelect.addEventListener('change', () => {
   viewer.setRenderMode(parseInt(renderModeSelect.value, 10) as RenderMode);
 });
 
-async function setDepthModelVersion(version: 'v2' | 'v3') {
-  if (modelV2Btn && modelV3Btn) {
-    if (version === 'v2') {
-      modelV2Btn.classList.add('active');
-      modelV3Btn.classList.remove('active');
-    } else {
-      modelV3Btn.classList.add('active');
-      modelV2Btn.classList.remove('active');
-    }
-  }
-
-  // 1. Update model version on depth controller
-  const setModelPromise = depthController.setModelVersion(version);
-
-  // 2. Immediately pull current timestamp's depth map from videoDepthTimeline (0 ms instant switch!)
-  if (videoDepthTimeline && sourceVideo.readyState >= HTMLMediaElement.HAVE_CURRENT_DATA) {
-    const depth = videoDepthTimeline.getDepthAtTime(sourceVideo.currentTime, version);
-    if (depth) {
-      viewer.uploadExternalDepthMap(depth, 480, 240);
-      const verticalTilt = motionController.getVerticalTilt();
-      viewer.renderVideoFrame(sourceVideo, currentViewShift, verticalTilt);
-    }
-  }
-
-  await setModelPromise;
-  if (sourceVideo.readyState >= HTMLMediaElement.HAVE_CURRENT_DATA) {
-    depthController.processVideoFrame(sourceVideo, viewer.getBaseDisparity(), 16).catch(() => {});
-  }
-}
-
-if (modelV2Btn) {
-  modelV2Btn.addEventListener('click', () => {
-    setDepthModelVersion('v2');
-  });
-}
-
-if (modelV3Btn) {
-  modelV3Btn.addEventListener('click', () => {
-    setDepthModelVersion('v3');
-  });
-}
 
 if (upscaleSelect) {
   upscaleSelect.addEventListener('change', () => {
@@ -474,7 +432,6 @@ exportWebmBtn.addEventListener('click', () => triggerExport('webm'));
 // Phase accumulator for smooth frequency transitions without teleporting
 let lastTimestampMs = 0;
 let currentPhase = 0;
-let currentViewShift = 0.5;
 
 // Main Animation & Parallax Render Loop (60 FPS) with Apple Vision Pro 3D Window Movement
 function renderLoop(timestampMs: number) {
@@ -500,7 +457,6 @@ function renderLoop(timestampMs: number) {
     const sine = Math.sin(currentPhase);
     viewShift = Math.max(0.0, Math.min(1.0, 0.5 + amp * sine));
   }
-  currentViewShift = viewShift;
 
   // Enhanced Apple Vision Pro Spatial Window Movement & Reactive Specular Border
   if (spatialWindow) {
@@ -586,7 +542,7 @@ requestAnimationFrame(renderLoop);
     return depthController.inferenceTimeMs;
   },
   hasExternalDepthMap: () => viewer.hasExternalDepthMap(),
-  setDepthModel: (v: 'v3' | 'v2') => setDepthModelVersion(v),
+  setDepthModel: (v: 'v3') => depthController.setModelVersion(v),
   setMotionMode: (mode: 'auto' | 'interactive' | 'manual') => {
     motionMode = mode;
     motionModeSelect.value = mode;
