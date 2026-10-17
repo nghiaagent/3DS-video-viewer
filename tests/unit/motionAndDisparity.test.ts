@@ -262,7 +262,9 @@ describe('Rust Wasm SIMD Disparity Integration', () => {
       const tsDetected = WebGLParallaxViewer.prototype.estimateGlobalBaselineFromRgba(
         syntheticRgba,
         sbsW,
-        eyeH
+        eyeH,
+        -112,
+        32
       );
       expect(tsDetected).toBe(shift);
 

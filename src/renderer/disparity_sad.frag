@@ -6,24 +6,21 @@ out vec4 outColor;
 
 uniform sampler2D u_sbsTexture;
 uniform sampler2D u_prevDispTexture;
-uniform vec2 u_eyeTexelSize;     // vec2(1.0 / eyeWidth, 1.0 / eyeHeight)
-uniform int u_maxDisp;           // half search radius e.g. 24 or 16
-uniform int u_baseDisp;          // global convergence baseline offset e.g. -72 or 0
-uniform float u_temporalWeight; // temporal stabilization e.g. 0.75, or 0.0 on first frame
+uniform vec2 u_eyeTexelSize;     // Full-res eye texel size e.g. vec2(1.0 / 480.0, 1.0 / 240.0)
+uniform int u_maxDisp;           // Search radius e.g. 16 or 20
+uniform int u_baseDisp;          // Convergence baseline offset e.g. 8 (range [-4, 16])
+uniform float u_temporalWeight; // Temporal stabilization weight e.g. 0.70
 
 float getLuma(vec3 rgb) {
     return dot(rgb, vec3(0.299, 0.587, 0.114));
 }
 
 void main() {
-    float maxD = float(u_baseDisp + u_maxDisp);
-    float minD = float(u_baseDisp - u_maxDisp);
-
-    // Guard bounds so left and right sampling stays safely within eye bounds
-    float minX = clamp(max(6.0, maxD + 6.0) * u_eyeTexelSize.x, 0.02, 0.48);
-    float maxX = clamp(1.0 - max(6.0, 6.0 - minD) * u_eyeTexelSize.x, 0.52, 0.98);
-    float minY = 4.0 * u_eyeTexelSize.y;
-    float maxY = 1.0 - 4.0 * u_eyeTexelSize.y;
+    // Keep interior region safely away from extreme borders
+    const float minX = 0.03;
+    const float maxX = 0.97;
+    const float minY = 0.03;
+    const float maxY = 0.97;
 
     vec2 uv = vec2(
         clamp(v_uv.x, minX, maxX),
@@ -45,13 +42,13 @@ void main() {
         float cost = 0.0;
         float rightCenterLuma = getLuma(texture(u_sbsTexture, vec2(0.5 + (uv.x - float(d) * u_eyeTexelSize.x) * 0.5, uv.y)).rgb);
 
-        // 7x5 horizontally-weighted census + luma SAD
-        for (int wy = -2; wy <= 2; wy += 2) {
-            float yOffset = uv.y + float(wy) * u_eyeTexelSize.y;
+        // 9x7 patch matching sampling full-res u_sbsTexture
+        for (int wy = -3; wy <= 3; wy += 2) {
+            float yOffset = clamp(uv.y + float(wy) * u_eyeTexelSize.y, 0.01, 0.99);
 
-            for (int wx = -3; wx <= 3; wx += 1) {
-                float lx = (uv.x + float(wx) * u_eyeTexelSize.x) * 0.5;
-                float rx = 0.5 + (uv.x + float(wx - d) * u_eyeTexelSize.x) * 0.5;
+            for (int wx = -4; wx <= 4; wx += 2) {
+                float lx = clamp((uv.x + float(wx) * u_eyeTexelSize.x) * 0.5, 0.002, 0.498);
+                float rx = 0.5 + clamp((uv.x + float(wx - d) * u_eyeTexelSize.x) * 0.5, 0.002, 0.498);
 
                 vec3 rgbL = texture(u_sbsTexture, vec2(lx, yOffset)).rgb;
                 vec3 rgbR = texture(u_sbsTexture, vec2(rx, yOffset)).rgb;
@@ -59,13 +56,13 @@ void main() {
                 float lL = getLuma(rgbL);
                 float lR = getLuma(rgbR);
 
-                // Horizontal spatial kernel weighting
-                float weight = (wx == 0 && wy == 0) ? 1.8 : ((abs(wx) <= 1 && wy == 0) ? 1.4 : 0.85);
+                // Center-weighted kernel
+                float weight = (wx == 0 && wy == 0) ? 2.0 : ((abs(wx) <= 2 && abs(wy) <= 1) ? 1.4 : 0.85);
 
-                // Luma SAD + census sign correlation
+                // Luma SAD + illumination-invariant census term
                 float sadTerm = abs(lL - lR);
                 float censusTerm = abs(sign(lL - centerLumaL) - sign(lR - rightCenterLuma));
-                cost += (sadTerm + censusTerm * 0.12) * weight;
+                cost += (sadTerm + censusTerm * 0.10) * weight;
             }
         }
 
@@ -75,14 +72,14 @@ void main() {
         }
     }
 
-    // Normalized disparity: 0.5 represents exact convergence at u_baseDisp
+    // Normalized disparity: 0.5 represents convergence at u_baseDisp
     float normD = clamp(float(bestD - startD) / float(max(1, endD - startD)), 0.0, 1.0);
 
-    // Temporal stabilization ping-pong blend
+    // Ping-pong temporal stabilization
     if (u_temporalWeight > 0.01) {
         float prevD = texture(u_prevDispTexture, v_uv).r;
         if (prevD > 0.001 && prevD < 0.999) {
-            normD = mix(normD, prevD, clamp(u_temporalWeight, 0.0, 0.82));
+            normD = mix(normD, prevD, clamp(u_temporalWeight, 0.0, 0.75));
         }
     }
 

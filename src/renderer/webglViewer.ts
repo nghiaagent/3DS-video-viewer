@@ -71,6 +71,7 @@ export class WebGLParallaxViewer {
     maxDisparityUV: WebGLUniformLocation | null;
     windowCrop: WebGLUniformLocation | null;
     eyeTexelSize: WebGLUniformLocation | null;
+    dispTexelSize: WebGLUniformLocation | null;
     zeroDispNorm: WebGLUniformLocation | null;
     baseDisp: WebGLUniformLocation | null;
     renderMode: WebGLUniformLocation | null;
@@ -82,6 +83,7 @@ export class WebGLParallaxViewer {
     maxDisparityUV: null,
     windowCrop: null,
     eyeTexelSize: null,
+    dispTexelSize: null,
     zeroDispNorm: null,
     baseDisp: null,
     renderMode: null,
@@ -89,7 +91,7 @@ export class WebGLParallaxViewer {
   };
 
   private sbsTexture: WebGLTexture | null = null;
-  // Ping-pong disparity textures and FBOs for temporal stabilization
+  // Ping-pong coarse disparity textures and FBOs for silky-smooth 2.5D relief
   private dispTextures: [WebGLTexture | null, WebGLTexture | null] = [null, null];
   private disparityFbos: [WebGLFramebuffer | null, WebGLFramebuffer | null] = [null, null];
   private pingPongIdx: number = 0;
@@ -100,16 +102,18 @@ export class WebGLParallaxViewer {
   private upscale: UpscaleMultiplier = 2;
   private renderMode: RenderMode = 0;
   private windowCrop: number = 0.06;
-  private maxDisp: number = 24;
+  private maxDisp: number = 20;
   private flipY: boolean = true; // Default to true so HTMLVideoElement is upright on screen
 
-  // Auto-Calibrated Stereo Convergence Baseline
-  private baseDisp: number = 0;
-  private smoothedBaseDisp: number = 0;
+  // Auto-Calibrated Stereo Convergence Baseline (real 3DS cameras have d in [-4, 16], centered ~8..12)
+  private baseDisp: number = 8;
+  private smoothedBaseDisp: number = 8;
   private manualBaseDisp: number | null = null;
 
   private eyeWidth: number = 480;
   private eyeHeight: number = 240;
+  private dispWidth: number = 80;
+  private dispHeight: number = 40;
 
   // Offscreen canvas for fast baseline estimation from video elements
   private baselineCanvas: HTMLCanvasElement | OffscreenCanvas | null = null;
@@ -127,7 +131,7 @@ export class WebGLParallaxViewer {
     backend: 'gpu',
     renderMode: 0,
     upscale: 2,
-    baseDisp: 0,
+    baseDisp: 8,
   };
 
   constructor(canvas: HTMLCanvasElement, options?: ViewerOptions) {
@@ -201,6 +205,7 @@ export class WebGLParallaxViewer {
       maxDisparityUV: gl.getUniformLocation(this.perspectiveProgram, 'u_maxDisparityUV'),
       windowCrop: gl.getUniformLocation(this.perspectiveProgram, 'u_windowCrop'),
       eyeTexelSize: gl.getUniformLocation(this.perspectiveProgram, 'u_eyeTexelSize'),
+      dispTexelSize: gl.getUniformLocation(this.perspectiveProgram, 'u_dispTexelSize'),
       zeroDispNorm: gl.getUniformLocation(this.perspectiveProgram, 'u_zeroDispNorm'),
       baseDisp: gl.getUniformLocation(this.perspectiveProgram, 'u_baseDisp'),
       renderMode: gl.getUniformLocation(this.perspectiveProgram, 'u_renderMode'),
@@ -223,6 +228,10 @@ export class WebGLParallaxViewer {
     this.eyeWidth = width;
     this.eyeHeight = height;
 
+    // Coarse disparity grid: 80x40 with LINEAR filtering for smooth regional depth
+    this.dispWidth = Math.max(64, Math.round(width / 6));
+    this.dispHeight = Math.max(36, Math.round(height / 6));
+
     for (let i = 0; i < 2; i++) {
       if (!this.dispTextures[i]) {
         this.dispTextures[i] = gl.createTexture();
@@ -233,7 +242,7 @@ export class WebGLParallaxViewer {
       gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_S, gl.CLAMP_TO_EDGE);
       gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE);
 
-      gl.texImage2D(gl.TEXTURE_2D, 0, gl.R8, width, height, 0, gl.RED, gl.UNSIGNED_BYTE, null);
+      gl.texImage2D(gl.TEXTURE_2D, 0, gl.R8, this.dispWidth, this.dispHeight, 0, gl.RED, gl.UNSIGNED_BYTE, null);
 
       if (!this.disparityFbos[i]) {
         this.disparityFbos[i] = gl.createFramebuffer();
@@ -244,7 +253,7 @@ export class WebGLParallaxViewer {
       const status = gl.checkFramebufferStatus(gl.FRAMEBUFFER);
       if (status !== gl.FRAMEBUFFER_COMPLETE) {
         console.warn(`Disparity FBO ${i} incomplete with R8 (${status}), falling back to RGBA8`);
-        gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA8, width, height, 0, gl.RGBA, gl.UNSIGNED_BYTE, null);
+        gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA8, this.dispWidth, this.dispHeight, 0, gl.RGBA, gl.UNSIGNED_BYTE, null);
         gl.framebufferTexture2D(gl.FRAMEBUFFER, gl.COLOR_ATTACHMENT0, gl.TEXTURE_2D, this.dispTextures[i], 0);
       }
     }
@@ -345,14 +354,16 @@ export class WebGLParallaxViewer {
   }
 
   /**
-   * Fast auto-calibrated horizontal stereo baseline shift estimation.
-   * Searches coarse range [-112, 32] (step 4), followed by fine range [-3, +3] (step 1).
-   * Runs in < 0.2 ms on downsampled or sub-sampled frames.
+   * Fast stereo baseline estimation.
+   * Defaults to search range [-8, 24] (covering the true 3DS divergence window).
+   * Supports custom range for automated tests.
    */
   public estimateGlobalBaselineFromRgba(
     rgba: Uint8Array,
     sbsWidth: number,
-    sbsHeight: number
+    sbsHeight: number,
+    minShift: number = -8,
+    maxShift: number = 24
   ): number {
     const eyeW = Math.floor(sbsWidth / 2);
     const eyeH = sbsHeight;
@@ -362,11 +373,11 @@ export class WebGLParallaxViewer {
     const xStart = Math.max(4, Math.floor(eyeW * 0.2));
     const xEnd = Math.min(eyeW - 4, Math.floor(eyeW * 0.8));
 
-    let bestCoarseD = 0;
+    let bestCoarseD = minShift;
     let minCoarseMad = 1e9;
 
-    // Coarse pass: step 4
-    for (let d = -112; d <= 32; d += 4) {
+    // Coarse pass: step 2
+    for (let d = minShift; d <= maxShift; d += 2) {
       let diffSum = 0;
       let count = 0;
 
@@ -399,8 +410,8 @@ export class WebGLParallaxViewer {
     // Fine pass: step 1 around bestCoarseD
     let bestD = bestCoarseD;
     let minFineMad = 1e9;
-    const fineMin = Math.max(-112, bestCoarseD - 3);
-    const fineMax = Math.min(32, bestCoarseD + 3);
+    const fineMin = Math.max(minShift, bestCoarseD - 2);
+    const fineMax = Math.min(maxShift, bestCoarseD + 2);
 
     for (let d = fineMin; d <= fineMax; d++) {
       let diffSum = 0;
@@ -442,12 +453,14 @@ export class WebGLParallaxViewer {
       return;
     }
 
-    const detected = this.estimateGlobalBaselineFromRgba(rgba, sbsWidth, sbsHeight);
+    const detected = this.estimateGlobalBaselineFromRgba(rgba, sbsWidth, sbsHeight, -8, 24);
+    // Clamp to valid 3DS hardware stereo baseline range [-4, 16]
+    const clamped = Math.max(-4, Math.min(16, detected));
+
     if (this.frameCountTotal <= 1) {
-      this.smoothedBaseDisp = detected;
+      this.smoothedBaseDisp = clamped;
     } else {
-      // Exponential moving average for temporal stability
-      this.smoothedBaseDisp = 0.75 * this.smoothedBaseDisp + 0.25 * detected;
+      this.smoothedBaseDisp = 0.8 * this.smoothedBaseDisp + 0.2 * clamped;
     }
     this.baseDisp = Math.round(this.smoothedBaseDisp);
   }
@@ -479,20 +492,21 @@ export class WebGLParallaxViewer {
         const img = ctx.getImageData(0, 0, 240, 60);
         const raw = new Uint8Array(img.data.buffer, img.data.byteOffset, img.data.byteLength);
 
-        // At 240x60, eyeW = 120, which is downsampled by factor 4 relative to 960x240 (480 eyeW)
-        const detectedHalf = this.estimateGlobalBaselineFromRgba(raw, 240, 60);
+        // Estimate on downsampled buffer
+        const detectedHalf = this.estimateGlobalBaselineFromRgba(raw, 240, 60, -4, 12);
         const scale = this.eyeWidth / 120;
-        const detected = Math.round(detectedHalf * scale);
+        const scaled = Math.round(detectedHalf * scale);
+        const clamped = Math.max(-4, Math.min(16, scaled));
 
         if (this.frameCountTotal <= 1) {
-          this.smoothedBaseDisp = detected;
+          this.smoothedBaseDisp = clamped;
         } else {
-          this.smoothedBaseDisp = 0.75 * this.smoothedBaseDisp + 0.25 * detected;
+          this.smoothedBaseDisp = 0.8 * this.smoothedBaseDisp + 0.2 * clamped;
         }
         this.baseDisp = Math.round(this.smoothedBaseDisp);
       }
     } catch {
-      // Gracefully ignore if 2D context extraction fails in headless tests
+      // Gracefully ignore if 2D context extraction fails in headless environments
     }
   }
 
@@ -630,7 +644,7 @@ export class WebGLParallaxViewer {
     const readIdx = 1 - this.pingPongIdx;
 
     gl.bindFramebuffer(gl.FRAMEBUFFER, this.disparityFbos[writeIdx]);
-    gl.viewport(0, 0, this.eyeWidth, this.eyeHeight);
+    gl.viewport(0, 0, this.dispWidth, this.dispHeight);
 
     gl.useProgram(this.disparityProgram);
     gl.bindVertexArray(this.vao);
@@ -647,7 +661,7 @@ export class WebGLParallaxViewer {
     gl.uniform1i(this.dispLocs.maxDisp, this.maxDisp);
     gl.uniform1i(this.dispLocs.baseDisp, this.baseDisp);
 
-    const temporalWeight = this.frameCountTotal > 1 ? 0.75 : 0.0;
+    const temporalWeight = this.frameCountTotal > 1 ? 0.70 : 0.0;
     gl.uniform1f(this.dispLocs.temporalWeight, temporalWeight);
     gl.uniform1f(this.dispLocs.flipY, 0.0); // Pass 1 FBO disparity coordinates match sbsTexture 1:1
 
@@ -673,9 +687,10 @@ export class WebGLParallaxViewer {
     gl.uniform1i(this.perspLocs.dispTexture, 1);
 
     gl.uniform1f(this.perspLocs.viewShift, Math.max(0.0, Math.min(1.0, viewShift)));
-    gl.uniform1f(this.perspLocs.maxDisparityUV, this.maxDisp / this.eyeWidth);
+    gl.uniform1f(this.perspLocs.maxDisparityUV, Math.min(0.04, this.maxDisp / this.eyeWidth));
     gl.uniform1f(this.perspLocs.windowCrop, this.windowCrop);
     gl.uniform2f(this.perspLocs.eyeTexelSize, 1.0 / this.eyeWidth, 1.0 / this.eyeHeight);
+    gl.uniform2f(this.perspLocs.dispTexelSize, 1.0 / this.dispWidth, 1.0 / this.dispHeight);
     gl.uniform1f(this.perspLocs.zeroDispNorm, 0.5);
     gl.uniform1i(this.perspLocs.baseDisp, this.baseDisp);
     gl.uniform1i(this.perspLocs.renderMode, this.renderMode);

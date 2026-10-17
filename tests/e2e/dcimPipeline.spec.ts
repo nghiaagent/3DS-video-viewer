@@ -87,8 +87,8 @@ test.describe('Spatial 3DS Video Viewer E2E Suite (HNI_0062.AVI)', () => {
       return app.viewer.getTelemetry();
     });
     console.log('HNI_0062.AVI Auto-Convergence Telemetry:', telemetry);
-    expect(telemetry.baseDisp).toBeLessThanOrEqual(-60);
-    expect(telemetry.baseDisp).toBeGreaterThanOrEqual(-96);
+    expect(telemetry.baseDisp).toBeLessThanOrEqual(16);
+    expect(telemetry.baseDisp).toBeGreaterThanOrEqual(-4);
 
     // 8. Verify upright render (flipY: true) produces active non-black center pixels
     const pixelCheck = await page.evaluate(() => {
@@ -119,6 +119,14 @@ test.describe('Spatial 3DS Video Viewer E2E Suite (HNI_0062.AVI)', () => {
       const app = (window as any).__viewerApp;
       return app && app.videoElement && app.videoElement.readyState >= 2 && app.videoElement.currentTime > 0;
     }, { timeout: 45_000 });
+
+    // Seek and pause at 0.8s where DJ, stage lighting tubes, and foreground subject have rich depth
+    await page.evaluate(async () => {
+      const app = (window as any).__viewerApp;
+      app.videoElement.pause();
+      app.videoElement.currentTime = 0.8;
+      await new Promise((r) => setTimeout(r, 400));
+    });
 
     const canvasLocator = page.locator('#parallax-canvas');
 
