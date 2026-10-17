@@ -9,6 +9,7 @@ export interface CalibrateDepthOptions {
   step?: number;
   expandRadius?: number;
   alphaConfidence?: number;
+  contrastStretch?: boolean;
 }
 
 export interface CalibrateDepthResult {
@@ -46,13 +47,15 @@ export interface DepthAnythingControllerOptions {
   wasmPaths?: Record<string, string> | string;
   modelPath?: string;
   modelPathWebGPU?: string;
-  inputSize?: number; // 256 or 364
+  modelVersion?: 'v3' | 'v2';
+  inputSize?: number; // default 504 (multiple of 14: 36 * 14)
   baseDisp?: number;
   maxDisp?: number;
   expandRadius?: number;
   dilateRadius?: number;
   gradThreshold?: number;
   step?: number;
+  contrastStretch?: boolean;
   onDepthMapReady?: DepthMapReadyCallback;
   customInfer?: (
     leftRgba: Uint8Array,
@@ -244,8 +247,9 @@ export function calibrateDepthWithStereoSBS(
   let sbsHeight = sbsHeightArg;
   let gradThreshold = 12.0;
   let step = 2;
-  let expandRadius = 2;
-  let alphaConfidence = 0.25;
+  let expandRadius = 1;
+  let alphaConfidence = 0.0;
+  let contrastStretch = true;
 
   if (typeof baseDispOrOptions === 'object') {
     const opts = baseDispOrOptions;
@@ -257,6 +261,7 @@ export function calibrateDepthWithStereoSBS(
     if (opts.step !== undefined) step = opts.step;
     if (opts.expandRadius !== undefined) expandRadius = opts.expandRadius;
     if (opts.alphaConfidence !== undefined) alphaConfidence = opts.alphaConfidence;
+    if (opts.contrastStretch !== undefined) contrastStretch = opts.contrastStretch;
   } else {
     baseDisp = baseDispOrOptions;
     if (extraOptions) {
@@ -264,6 +269,7 @@ export function calibrateDepthWithStereoSBS(
       if (extraOptions.step !== undefined) step = extraOptions.step;
       if (extraOptions.expandRadius !== undefined) expandRadius = extraOptions.expandRadius;
       if (extraOptions.alphaConfidence !== undefined) alphaConfidence = extraOptions.alphaConfidence;
+      if (extraOptions.contrastStretch !== undefined) contrastStretch = extraOptions.contrastStretch;
     }
   }
 
@@ -527,49 +533,39 @@ export function calibrateDepthWithStereoSBS(
   }
 
   // --------------------------------------------------------------------------
-  // STEP C: Photometric Residual Refinement & Foreground Dilation
+  // STEP C: Calibrated Depth Mapping & Percentile Contrast Stretching
   // --------------------------------------------------------------------------
-  const refinedDepthUint8 = new Uint8Array(eyeWidth * eyeHeight);
-
-  for (let y = 0; y < eyeHeight; y++) {
-    const rowOffset = y * eyeWidth;
-    for (let x = 0; x < eyeWidth; x++) {
-      const idx = rowOffset + x;
-      const rawVal = leftDaDepth[idx];
-      const dCal = Math.max(0, Math.min(1, scaleA * rawVal + shiftB));
-
-      const conf = anchorConf[idx];
-      if (conf > 0) {
-        const dAnchor = anchorNormDisp[idx];
-        const dispCal = dispMin + dCal * dispSpan;
-        const dispAnc = dispMin + dAnchor * dispSpan;
-
-        const xrCal = Math.round(x - dispCal);
-        const xrAnc = Math.round(x - dispAnc);
-
-        const lVal = leftLum[idx];
-        const errCal = xrCal >= 0 && xrCal < eyeWidth ? Math.abs(lVal - rightLum[rowOffset + xrCal]) : 999;
-        const errAnc = xrAnc >= 0 && xrAnc < eyeWidth ? Math.abs(lVal - rightLum[rowOffset + xrAnc]) : 999;
-
-        if (errAnc < errCal) {
-          const alpha = alphaConfidence * conf;
-          const dRefined = (1.0 - alpha) * dCal + alpha * dAnchor;
-          refinedDepthUint8[idx] = Math.round(Math.max(0, Math.min(1, dRefined)) * 255);
-          continue;
-        }
-      }
-
-      refinedDepthUint8[idx] = Math.round(dCal * 255);
-    }
+  const calibratedFloat = new Float32Array(eyeWidth * eyeHeight);
+  for (let i = 0; i < calibratedFloat.length; i++) {
+    calibratedFloat[i] = scaleA * leftDaDepth[i] + shiftB;
   }
 
-  // Foreground dilation (Tiefling expandDepthMap)
+  // Compute robust percentiles (p2 and p98) to stretch depth map to full [0, 255] dynamic range
+  let p2 = 0.0;
+  let p98 = 1.0;
+  if (contrastStretch && calibratedFloat.length > 0) {
+    const sorted = Float32Array.from(calibratedFloat).sort();
+    p2 = sorted[Math.floor(sorted.length * 0.02)];
+    p98 = sorted[Math.floor(sorted.length * 0.98)];
+  }
+  const range = p98 - p2;
+  const invRange = range > 1e-5 ? 1.0 / range : 1.0;
+
+  const refinedDepthUint8 = new Uint8Array(eyeWidth * eyeHeight);
+  for (let i = 0; i < calibratedFloat.length; i++) {
+    const norm = contrastStretch
+      ? Math.max(0, Math.min(1, (calibratedFloat[i] - p2) * invRange))
+      : Math.max(0, Math.min(1, calibratedFloat[i]));
+    refinedDepthUint8[i] = Math.round(norm * 255);
+  }
+
+  // Foreground dilation (Tiefling expandDepthMap) with clean default radius = 1
   const finalCalibratedDepth =
     expandRadius > 0
       ? expandDepthMap(refinedDepthUint8, eyeWidth, eyeHeight, expandRadius)
       : refinedDepthUint8;
 
-  // Compute SBS Photometric Reconstruction MAE
+  // Compute SBS Photometric Reconstruction MAE from physical calibrated disparity
   let sumMae = 0;
   let countMae = 0;
 
@@ -577,7 +573,7 @@ export function calibrateDepthWithStereoSBS(
     const rowOffset = y * eyeWidth;
     for (let x = 0; x < eyeWidth; x++) {
       const idx = rowOffset + x;
-      const dNorm = finalCalibratedDepth[idx] / 255.0;
+      const dNorm = Math.max(0, Math.min(1, calibratedFloat[idx]));
       const disp = dispMin + dNorm * dispSpan;
       const xr = Math.round(x - disp);
 
@@ -611,6 +607,7 @@ export class DepthAnythingController {
   private busy: boolean = false;
   private baseDisp: number = 0;
   private maxDisp: number = 16;
+  private modelVersion: 'v3' | 'v2' = 'v3';
   private options: DepthAnythingControllerOptions;
   private frameCounter: number = 0;
   private lastFpsTime: number = 0;
@@ -633,6 +630,11 @@ export class DepthAnythingController {
     onDepthMapReady?: DepthMapReadyCallback
   ) {
     this.options = { ...options };
+    this.modelVersion = options?.modelVersion || 'v3';
+    if (this.options.inputSize === undefined) this.options.inputSize = 504;
+    if (this.options.expandRadius === undefined && this.options.dilateRadius === undefined) {
+      this.options.expandRadius = 1;
+    }
     if (onDepthMapReady) {
       this.options.onDepthMapReady = onDepthMapReady;
     }
@@ -646,6 +648,61 @@ export class DepthAnythingController {
 
   public isReady(): boolean {
     return this.initialized;
+  }
+
+  public getModelVersion(): 'v3' | 'v2' {
+    return this.modelVersion;
+  }
+
+  public async setModelVersion(version: 'v3' | 'v2'): Promise<void> {
+    if (this.modelVersion === version && this.initialized) {
+      return;
+    }
+    this.modelVersion = version;
+    this.options.modelVersion = version;
+
+    const defaultModel = version === 'v3' ? '/models/depthanythingv3.onnx' : '/models/depthanythingv2.onnx';
+    const modelPath = typeof window !== 'undefined'
+      ? new URL('.' + defaultModel, window.location.href).href
+      : defaultModel;
+    this.options.modelPath = modelPath;
+
+    if (this.worker) {
+      await new Promise<void>((resolve, reject) => {
+        const timeout = setTimeout(() => resolve(), 15000);
+        const handler = (e: MessageEvent<WorkerOutMessage>) => {
+          if (e.data.type === 'initDone') {
+            clearTimeout(timeout);
+            this.currentBackend = e.data.backend;
+            this.initialized = true;
+            this.worker?.removeEventListener('message', handler);
+            resolve();
+          } else if (e.data.type === 'error') {
+            clearTimeout(timeout);
+            this.worker?.removeEventListener('message', handler);
+            reject(new Error(e.data.error));
+          }
+        };
+        this.worker?.addEventListener('message', handler);
+
+        const defaultWasmPaths = typeof window !== 'undefined'
+          ? new URL('./onnx-wasm/', window.location.href).href
+          : '/onnx-wasm/';
+
+        const initMsg: WorkerInitMessage = {
+          type: 'init',
+          wasmPaths: this.options.wasmPaths || defaultWasmPaths,
+          modelPath: this.options.modelPath,
+          modelPathWebGPU: this.options.modelPathWebGPU,
+          preferWebGPU: true,
+        };
+        this.worker?.postMessage(initMsg);
+      });
+    } else {
+      this.initialized = false;
+      this.initPromise = null;
+      await this.init();
+    }
   }
 
   public setBaseDisparity(baseDisp: number): void {
@@ -713,22 +770,37 @@ export class DepthAnythingController {
         return;
       }
 
-      try {
-        if (this.options.worker) {
-          this.worker = this.options.worker;
-        } else if (this.options.workerUrl) {
-          this.worker = new Worker(this.options.workerUrl, { type: 'module' });
-        } else {
-          this.worker = new Worker(new URL('./depthAnythingWorker.ts', import.meta.url), { type: 'module' });
+      const tryInitModel = async (version: 'v3' | 'v2'): Promise<void> => {
+        const defaultModel = version === 'v3' ? '/models/depthanythingv3.onnx' : '/models/depthanythingv2.onnx';
+        const defaultModelPath = typeof window !== 'undefined'
+          ? new URL('.' + defaultModel, window.location.href).href
+          : defaultModel;
+
+        const defaultWasmPaths = typeof window !== 'undefined'
+          ? new URL('./onnx-wasm/', window.location.href).href
+          : '/onnx-wasm/';
+
+        const initMsg: WorkerInitMessage = {
+          type: 'init',
+          wasmPaths: this.options.wasmPaths || defaultWasmPaths,
+          modelPath: this.options.modelPath || defaultModelPath,
+          modelPathWebGPU: this.options.modelPathWebGPU,
+          preferWebGPU: true,
+        };
+
+        if (!this.worker) {
+          if (this.options.worker) {
+            this.worker = this.options.worker;
+          } else if (this.options.workerUrl) {
+            this.worker = new Worker(this.options.workerUrl, { type: 'module' });
+          } else {
+            this.worker = new Worker(new URL('./depthAnythingWorker.ts', import.meta.url), { type: 'module' });
+          }
+          this.setupWorkerListeners();
         }
 
-        this.setupWorkerListeners();
-
         await new Promise<void>((resolve, reject) => {
-          const timeout = setTimeout(() => {
-            resolve(); // Don't block indefinitely on init
-          }, 15000);
-
+          const timeout = setTimeout(() => resolve(), 15000);
           const initHandler = (e: MessageEvent<WorkerOutMessage>) => {
             if (e.data.type === 'initDone') {
               clearTimeout(timeout);
@@ -742,28 +814,24 @@ export class DepthAnythingController {
               reject(new Error(e.data.error));
             }
           };
-
           this.worker?.addEventListener('message', initHandler);
-
-          const defaultWasmPaths = typeof window !== 'undefined'
-            ? new URL('./onnx-wasm/', window.location.href).href
-            : '/onnx-wasm/';
-          const defaultModelPath = typeof window !== 'undefined'
-            ? new URL('./models/depthanythingv2.onnx', window.location.href).href
-            : '/models/depthanythingv2.onnx';
-
-          const initMsg: WorkerInitMessage = {
-            type: 'init',
-            wasmPaths: this.options.wasmPaths || defaultWasmPaths,
-            modelPath: this.options.modelPath || defaultModelPath,
-            modelPathWebGPU: this.options.modelPathWebGPU,
-            preferWebGPU: true,
-          };
           this.worker?.postMessage(initMsg);
         });
+      };
+
+      try {
+        await tryInitModel(this.modelVersion);
       } catch (err) {
-        console.warn('DepthAnythingController init error:', err);
-        this.initialized = true;
+        if (this.modelVersion === 'v3') {
+          console.warn('DepthAnythingController: v3 init failed, falling back to v2:', err);
+          this.modelVersion = 'v2';
+          this.options.modelVersion = 'v2';
+          this.options.modelPath = undefined;
+          await tryInitModel('v2');
+        } else {
+          console.warn('DepthAnythingController init error:', err);
+          this.initialized = true;
+        }
       }
     })();
 
@@ -800,7 +868,7 @@ export class DepthAnythingController {
       }
 
       // Step: Lock raw DepthAnything depth to real SBS stereo pair
-      const expandRadius = this.options.dilateRadius ?? this.options.expandRadius ?? 2;
+      const expandRadius = this.options.dilateRadius ?? this.options.expandRadius ?? 1;
       const calResult = calibrateDepthWithStereoSBS(
         result.rawDepth,
         sbsRgba,
@@ -812,6 +880,7 @@ export class DepthAnythingController {
           expandRadius,
           gradThreshold: this.options.gradThreshold ?? 12,
           step: this.options.step ?? 2,
+          contrastStretch: this.options.contrastStretch ?? true,
         }
       );
 
@@ -933,7 +1002,7 @@ export class DepthAnythingController {
     this.pendingMaxDisp = effectiveMaxDisp;
 
     const leftEyeRgba = extractLeftEyeRgba(sbsRgba, sbsWidth, sbsHeight);
-    const inputSize = this.options.inputSize || 256;
+    const inputSize = this.options.inputSize || 504;
 
     if (this.options.customInfer) {
       this.options

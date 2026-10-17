@@ -359,7 +359,29 @@ describe('stereoGuidedDepth & DepthAnything Integration', () => {
     controller.destroy();
   });
 
-  it('runs true ONNX inference with DepthAnythingV2 model in public/models/ if present', async () => {
+  it('DepthAnythingController supports modelVersion v3 and v2 switching and defaults', async () => {
+    const controller = new DepthAnythingController({
+      customInfer: async () => ({
+        rawDepth: new Float32Array(100),
+        backend: 'wasm',
+        inferenceTimeMs: 1.0,
+      }),
+    });
+
+    expect(controller.getModelVersion()).toBe('v3');
+    await controller.init();
+    expect(controller.isReady()).toBe(true);
+
+    await controller.setModelVersion('v2');
+    expect(controller.getModelVersion()).toBe('v2');
+
+    await controller.setModelVersion('v3');
+    expect(controller.getModelVersion()).toBe('v3');
+
+    controller.destroy();
+  });
+
+  it('runs true ONNX inference with DepthAnythingV2 model in public/models/ at 504px if present', async () => {
     const modelPath = path.resolve(__dirname, '../../public/models/depthanythingv2.onnx');
     if (!fs.existsSync(modelPath)) {
       console.log('Skipping real ONNX model test (model file not found)');
@@ -386,7 +408,7 @@ describe('stereoGuidedDepth & DepthAnything Integration', () => {
       testRgba[i + 3] = 255;
     }
 
-    const { rawDepth, inferenceTimeMs } = await runDepthInference(session, testRgba, w, h, 256);
+    const { rawDepth, inferenceTimeMs } = await runDepthInference(session, testRgba, w, h, 504);
     expect(rawDepth.length).toBe(w * h);
     expect(inferenceTimeMs).toBeGreaterThan(0);
 
@@ -396,4 +418,131 @@ describe('stereoGuidedDepth & DepthAnything Integration', () => {
       expect(rawDepth[i]).toBeLessThanOrEqual(1.0);
     }
   });
+
+  it('runs true ONNX inference with DepthAnythingV3 and DepthAnythingV2 at 504px and saves diagnostic heatmaps', async () => {
+    const v2Path = path.resolve(__dirname, '../../public/models/depthanythingv2.onnx');
+    const v3Path = path.resolve(__dirname, '../../public/models/depthanythingv3.onnx');
+    const wasmPaths = path.resolve(__dirname, '../../node_modules/onnxruntime-web/dist') + '/';
+
+    if (!fs.existsSync(v2Path) || !fs.existsSync(v3Path)) {
+      console.log('Skipping dual V2/V3 test (models not found)');
+      return;
+    }
+
+    // Try to load real HNI_0062.AVI frame or fallback to synthetic 480x240 frame
+    let leftRgba: Uint8Array;
+    let sbsRgba: Uint8Array;
+    const w = 480;
+    const h = 240;
+    const rawLeftFile = '/tmp/hni_0062_left.raw';
+    const rawSbsFile = '/tmp/hni_0062_sbs.raw';
+    const realAviPath = '/Users/nghiaagent/Downloads/3DS vids/DCIM/101NIN03/HNI_0062.AVI';
+
+    if (fs.existsSync(rawLeftFile) && fs.existsSync(rawSbsFile)) {
+      leftRgba = new Uint8Array(fs.readFileSync(rawLeftFile));
+      sbsRgba = new Uint8Array(fs.readFileSync(rawSbsFile));
+    } else if (fs.existsSync(realAviPath)) {
+      try {
+        const { execSync } = await import('node:child_process');
+        execSync(`ffmpeg -y -i "${realAviPath}" -vframes 1 -f rawvideo -pix_fmt rgba ${rawLeftFile} 2>/dev/null`);
+        execSync(`ffmpeg -y -i "${realAviPath}" -filter_complex "[0:v:0][0:v:1]hstack" -vframes 1 -f rawvideo -pix_fmt rgba ${rawSbsFile} 2>/dev/null`);
+        leftRgba = new Uint8Array(fs.readFileSync(rawLeftFile));
+        sbsRgba = new Uint8Array(fs.readFileSync(rawSbsFile));
+      } catch {
+        const syn = createSyntheticSBSFrame(w, h, -70, 16, 4, -4);
+        sbsRgba = syn.sbsRgba;
+        leftRgba = extractLeftEyeRgba(sbsRgba, syn.sbsW, syn.sbsH);
+      }
+    } else {
+      const syn = createSyntheticSBSFrame(w, h, -70, 16, 4, -4);
+      sbsRgba = syn.sbsRgba;
+      leftRgba = extractLeftEyeRgba(sbsRgba, syn.sbsW, syn.sbsH);
+    }
+
+    // Helper to save colormapped heatmap PNG
+    const saveHeatmap = (depthUint8: Uint8Array, eyeW: number, eyeH: number, outPath: string) => {
+      const ppmPath = outPath + '.ppm';
+      const header = `P6\n${eyeW} ${eyeH}\n255\n`;
+      const buf = Buffer.alloc(header.length + eyeW * eyeH * 3);
+      buf.write(header, 0, 'ascii');
+      let offset = header.length;
+
+      for (let i = 0; i < depthUint8.length; i++) {
+        const v = depthUint8[i] / 255.0;
+        let r = 0, g = 0, b = 0;
+        if (v < 0.25) {
+          const t = v / 0.25;
+          r = 0; g = Math.round(t * 255); b = 255;
+        } else if (v < 0.5) {
+          const t = (v - 0.25) / 0.25;
+          r = 0; g = 255; b = Math.round((1 - t) * 255);
+        } else if (v < 0.75) {
+          const t = (v - 0.5) / 0.25;
+          r = Math.round(t * 255); g = 255; b = 0;
+        } else {
+          const t = (v - 0.75) / 0.25;
+          r = 255; g = Math.round((1 - t) * 255); b = 0;
+        }
+        buf[offset++] = r;
+        buf[offset++] = g;
+        buf[offset++] = b;
+      }
+      fs.writeFileSync(ppmPath, buf);
+      try {
+        const { execSync } = require('node:child_process');
+        execSync(`ffmpeg -y -i "${ppmPath}" "${outPath}" 2>/dev/null`);
+        try { fs.unlinkSync(ppmPath); } catch {}
+      } catch {}
+    };
+
+    // 1. Run DepthAnythingV3 inference at 504px
+    const { session: sessionV3 } = await initSession({
+      modelPath: v3Path,
+      wasmPaths,
+      preferWebGPU: false,
+    });
+    const inferV3 = await runDepthInference(sessionV3, leftRgba, w, h, 504);
+    expect(inferV3.rawDepth.length).toBe(w * h);
+
+    const calV3 = calibrateDepthWithStereoSBS(inferV3.rawDepth, sbsRgba, -70, 16, w * 2, h, { expandRadius: 1 });
+    expect(calV3.width).toBe(w);
+    expect(calV3.height).toBe(h);
+    expect(calV3.anchorCount).toBeGreaterThan(50);
+    expect(calV3.sbsReconstructionMae).toBeLessThan(15.0);
+
+    // Verify full contrast dynamic range [0, 255]
+    let minV3 = 255, maxV3 = 0;
+    for (let i = 0; i < calV3.calibratedDepth.length; i++) {
+      const v = calV3.calibratedDepth[i];
+      if (v < minV3) minV3 = v;
+      if (v > maxV3) maxV3 = v;
+    }
+    expect(minV3).toBeLessThanOrEqual(25);
+    expect(maxV3).toBeGreaterThanOrEqual(230);
+
+    // 2. Run DepthAnythingV2 inference at 504px
+    const { session: sessionV2 } = await initSession({
+      modelPath: v2Path,
+      wasmPaths,
+      preferWebGPU: false,
+    });
+    const inferV2 = await runDepthInference(sessionV2, leftRgba, w, h, 504);
+    expect(inferV2.rawDepth.length).toBe(w * h);
+
+    const calV2 = calibrateDepthWithStereoSBS(inferV2.rawDepth, sbsRgba, -70, 16, w * 2, h, { expandRadius: 1 });
+    expect(calV2.width).toBe(w);
+    expect(calV2.height).toBe(h);
+    expect(calV2.sbsReconstructionMae).toBeLessThan(15.0);
+
+    // 3. Save diagnostic heatmaps to scratch directory
+    const scratchDir = '/Users/nghiaagent/.gemini/antigravity/brain/a683cc2e-6fb4-45b1-933b-9fcd06ec25f2/scratch';
+    if (fs.existsSync(scratchDir)) {
+      const v3Heatmap = path.join(scratchDir, 'depthanything_v3_heatmap.png');
+      const v2Heatmap = path.join(scratchDir, 'depthanything_v2_heatmap.png');
+      saveHeatmap(calV3.calibratedDepth, w, h, v3Heatmap);
+      saveHeatmap(calV2.calibratedDepth, w, h, v2Heatmap);
+      expect(fs.existsSync(v3Heatmap)).toBe(true);
+      expect(fs.existsSync(v2Heatmap)).toBe(true);
+    }
+  }, 30000);
 });

@@ -14,7 +14,7 @@ export interface WorkerInferMessage {
   rgbaData: Uint8Array;
   width: number;
   height: number;
-  size?: number; // model input resolution, default 256 or 364
+  size?: number; // model input resolution, default 504 (multiple of 14: 36 * 14)
 }
 
 export interface WorkerDepthResultMessage {
@@ -45,14 +45,16 @@ let cachedBackend: 'webgpu' | 'wasm' = 'wasm';
 let isInitialized = false;
 
 /**
- * Bilinearly scales RGBA image to targetSize x targetSize planar RGB Float32Array (RRR...GGG...BBB) in [0, 1].
+ * Bilinearly scales RGBA image to targetSize x targetSize planar RGB Float32Array (RRR...GGG...BBB).
+ * Applies ImageNet normalization ((rgb - mean) / std) by default for sharpest ViT features.
  * Preserves aspect ratio using center letterboxing and edge clamping to eliminate border artifacts.
  */
 export function preprocessRgbaToPlanarTensor(
   rgba: Uint8Array,
   srcW: number,
   srcH: number,
-  targetSize: number
+  targetSize: number,
+  normalizeImageNet: boolean = true
 ): {
   planarData: Float32Array;
   letterbox: { offsetX: number; offsetY: number; scaledW: number; scaledH: number };
@@ -67,6 +69,13 @@ export function preprocessRgbaToPlanarTensor(
   const rOffset = 0;
   const gOffset = targetSize * targetSize;
   const bOffset = 2 * targetSize * targetSize;
+
+  const meanR = 0.485;
+  const meanG = 0.456;
+  const meanB = 0.406;
+  const stdR = 0.229;
+  const stdG = 0.224;
+  const stdB = 0.225;
 
   for (let ty = 0; ty < targetSize; ty++) {
     // Map ty back to src image coordinate with border clamping
@@ -89,17 +98,23 @@ export function preprocessRgbaToPlanarTensor(
       const idx11 = (sy1 * srcW + sx1) * 4;
 
       // Bilinear interpolation for R, G, B
-      const r = (rgba[idx00] * (1 - fx) + rgba[idx01] * fx) * (1 - fy) +
-                (rgba[idx10] * (1 - fx) + rgba[idx11] * fx) * fy;
-      const g = (rgba[idx00 + 1] * (1 - fx) + rgba[idx01 + 1] * fx) * (1 - fy) +
-                (rgba[idx10 + 1] * (1 - fx) + rgba[idx11 + 1] * fx) * fy;
-      const b = (rgba[idx00 + 2] * (1 - fx) + rgba[idx01 + 2] * fx) * (1 - fy) +
-                (rgba[idx10 + 2] * (1 - fx) + rgba[idx11 + 2] * fx) * fy;
+      const r = ((rgba[idx00] * (1 - fx) + rgba[idx01] * fx) * (1 - fy) +
+                (rgba[idx10] * (1 - fx) + rgba[idx11] * fx) * fy) / 255.0;
+      const g = ((rgba[idx00 + 1] * (1 - fx) + rgba[idx01 + 1] * fx) * (1 - fy) +
+                (rgba[idx10 + 1] * (1 - fx) + rgba[idx11 + 1] * fx) * fy) / 255.0;
+      const b = ((rgba[idx00 + 2] * (1 - fx) + rgba[idx01 + 2] * fx) * (1 - fy) +
+                (rgba[idx10 + 2] * (1 - fx) + rgba[idx11 + 2] * fx) * fy) / 255.0;
 
       const destIdx = rowOffset + tx;
-      planarData[rOffset + destIdx] = r / 255.0;
-      planarData[gOffset + destIdx] = g / 255.0;
-      planarData[bOffset + destIdx] = b / 255.0;
+      if (normalizeImageNet) {
+        planarData[rOffset + destIdx] = (r - meanR) / stdR;
+        planarData[gOffset + destIdx] = (g - meanG) / stdG;
+        planarData[bOffset + destIdx] = (b - meanB) / stdB;
+      } else {
+        planarData[rOffset + destIdx] = r;
+        planarData[gOffset + destIdx] = g;
+        planarData[bOffset + destIdx] = b;
+      }
     }
   }
 
@@ -208,7 +223,7 @@ export async function initSession(options: {
     ort.env.wasm.numThreads = Math.min(4, navigator.hardwareConcurrency || 2);
   }
 
-  let modelPath = options.modelPath || '/models/depthanythingv2.onnx';
+  let modelPath = options.modelPath || '/models/depthanythingv3.onnx';
   if (typeof self !== 'undefined' && self.location && !modelPath.startsWith('http://') && !modelPath.startsWith('https://') && !modelPath.startsWith('blob:')) {
     modelPath = new URL(modelPath, self.location.origin + '/').href;
   }
@@ -238,10 +253,23 @@ export async function initSession(options: {
   }
 
   if (!session) {
-    session = await ort.InferenceSession.create(modelPath, {
-      executionProviders: ['wasm'],
-    });
-    backend = 'wasm';
+    try {
+      session = await ort.InferenceSession.create(modelPath, {
+        executionProviders: ['wasm'],
+      });
+      backend = 'wasm';
+    } catch (wasmErr) {
+      if (modelPath.includes('depthanythingv3.onnx')) {
+        const fallbackPath = modelPath.replace('depthanythingv3.onnx', 'depthanythingv2.onnx');
+        console.warn(`DepthAnythingWorker: Failed to load ${modelPath}, falling back to ${fallbackPath}:`, wasmErr);
+        session = await ort.InferenceSession.create(fallbackPath, {
+          executionProviders: ['wasm'],
+        });
+        backend = 'wasm';
+      } else {
+        throw wasmErr;
+      }
+    }
   }
 
   cachedSession = session;
@@ -252,28 +280,56 @@ export async function initSession(options: {
 
 /**
  * Runs inference on raw RGBA Left eye pixels using an active session.
+ * Supports both DepthAnythingV3 (rank 5 [1, 1, 3, H, W], 'pixel_values', 'predicted_depth')
+ * and DepthAnythingV2 (rank 4 [1, 3, H, W], 'image', 'depth').
  */
 export async function runDepthInference(
   session: ort.InferenceSession,
   rgbaData: Uint8Array,
   width: number,
   height: number,
-  size: number = 256
+  size: number = 504
 ): Promise<{ rawDepth: Float32Array; inferenceTimeMs: number }> {
-  const { planarData, letterbox } = preprocessRgbaToPlanarTensor(rgbaData, width, height, size);
-  const inputTensor = new ort.Tensor('float32', planarData, [1, 3, size, size]);
+  const { planarData, letterbox } = preprocessRgbaToPlanarTensor(rgbaData, width, height, size, true);
 
-  const inputName = session.inputNames[0] || 'image';
-  const outputName = session.outputNames[0] || 'depth';
+  const inputName = session.inputNames[0] || 'pixel_values';
+  const isRank5 = inputName === 'pixel_values';
+  const inputTensor = isRank5
+    ? new ort.Tensor('float32', planarData, [1, 1, 3, size, size])
+    : new ort.Tensor('float32', planarData, [1, 3, size, size]);
 
   const t0 = performance.now();
-  const results = await session.run({ [inputName]: inputTensor });
+  let results: Record<string, ort.Tensor>;
+  try {
+    results = await session.run({ [inputName]: inputTensor });
+  } catch (err: any) {
+    if (err && String(err.message).includes('Expected: 5')) {
+      const tensor5D = new ort.Tensor('float32', planarData, [1, 1, 3, size, size]);
+      results = await session.run({ [inputName]: tensor5D });
+    } else if (err && String(err.message).includes('Expected: 4')) {
+      const tensor4D = new ort.Tensor('float32', planarData, [1, 3, size, size]);
+      results = await session.run({ [inputName]: tensor4D });
+    } else {
+      throw err;
+    }
+  }
   const inferenceTimeMs = performance.now() - t0;
 
+  let outputName = session.outputNames[0] || 'predicted_depth';
+  if (session.outputNames.includes('predicted_depth')) {
+    outputName = 'predicted_depth';
+  } else if (session.outputNames.includes('depth')) {
+    outputName = 'depth';
+  }
+
   const outputTensor = results[outputName];
+  if (!outputTensor) {
+    throw new Error(`Output tensor '${outputName}' not found in results: ${Object.keys(results)}`);
+  }
+
   const dims = outputTensor.dims;
-  const modelH = dims.length >= 3 ? dims[dims.length - 2] : size;
-  const modelW = dims.length >= 3 ? dims[dims.length - 1] : size;
+  const modelH = dims.length >= 2 ? dims[dims.length - 2] : size;
+  const modelW = dims.length >= 2 ? dims[dims.length - 1] : size;
 
   const tensorData = outputTensor.data as Float32Array;
   const rawDepth = postprocessDepthTensor(tensorData, modelW, modelH, width, height, {
@@ -305,7 +361,7 @@ if (typeof self !== 'undefined' && typeof (self as any).postMessage === 'functio
         if (!cachedSession || !isInitialized) {
           throw new Error('DepthAnythingWorker not initialized');
         }
-        const inputSize = data.size || 256;
+        const inputSize = data.size || 504;
         const { rawDepth, inferenceTimeMs } = await runDepthInference(
           cachedSession,
           data.rgbaData,
