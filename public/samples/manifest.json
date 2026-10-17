@@ -1,0 +1,40 @@
+{
+  "samples": [
+    {
+      "id": "hni-0070-sbs",
+      "name": "HNI_0070 (Pre-converted SBS MP4)",
+      "type": "video/mp4",
+      "url": "samples/HNI_0070_sbs.mp4",
+      "format": "sbs_mp4",
+      "sizeBytes": 342981,
+      "width": 960,
+      "height": 240,
+      "fps": 20,
+      "description": "Ready-to-play Side-by-Side 3DS recording (100NIN03/HNI_0070.AVI)"
+    },
+    {
+      "id": "hni-0070-avi",
+      "name": "HNI_0070.AVI (Raw Dual MJPEG 3DS Clip)",
+      "type": "video/x-msvideo",
+      "url": "samples/HNI_0070.AVI",
+      "format": "raw_avi",
+      "sizeBytes": 372528,
+      "widthPerEye": 480,
+      "height": 240,
+      "fps": 20,
+      "description": "Raw Nintendo 3DS dual-stream AVI recording (~372 KB)"
+    },
+    {
+      "id": "hni-0065-avi",
+      "name": "HNI_0065.AVI (Raw Dual MJPEG 3DS Clip)",
+      "type": "video/x-msvideo",
+      "url": "samples/HNI_0065.AVI",
+      "format": "raw_avi",
+      "sizeBytes": 68648,
+      "widthPerEye": 480,
+      "height": 240,
+      "fps": 20,
+      "description": "Compact Nintendo 3DS dual-stream AVI recording (~68 KB)"
+    }
+  ]
+}

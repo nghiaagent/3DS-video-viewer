@@ -1,0 +1,30 @@
+{
+  "name": "3ds-video-viewer",
+  "private": true,
+  "version": "0.1.0",
+  "type": "module",
+  "scripts": {
+    "dev": "vite",
+    "build": "tsc && vite build",
+    "preview": "vite preview",
+    "prepare:fixtures": "node scripts/prepare-test-fixtures.mjs",
+    "build:wasm": "wasm-pack build crates/stereo-disparity --target web --release",
+    "test:unit": "vitest run",
+    "test:e2e": "playwright test"
+  },
+  "dependencies": {
+    "@ffmpeg/core": "^0.12.10",
+    "@ffmpeg/ffmpeg": "^0.12.15",
+    "@ffmpeg/util": "^0.12.2",
+    "coi-serviceworker": "^0.1.7",
+    "mp4-muxer": "^5.2.2",
+    "webm-muxer": "^5.0.2"
+  },
+  "devDependencies": {
+    "@playwright/test": "^1.50.0",
+    "@types/node": "^22.13.4",
+    "typescript": "^5.7.3",
+    "vite": "^6.2.0",
+    "vitest": "^3.0.6"
+  }
+}
