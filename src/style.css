@@ -496,3 +496,37 @@ body {
 #seek-bar {
   width: 130px;
 }
+
+/* Depth Model Switcher Toggle */
+.model-toggle-group {
+  display: inline-flex;
+  align-items: center;
+  background: rgba(0, 0, 0, 0.35);
+  border: 1px solid rgba(255, 255, 255, 0.12);
+  border-radius: 9999px;
+  padding: 2px;
+}
+
+.model-toggle-btn {
+  background: transparent;
+  border: none;
+  color: var(--text-muted);
+  font-size: 0.74rem;
+  font-weight: 600;
+  padding: 0.28rem 0.6rem;
+  border-radius: 9999px;
+  cursor: pointer;
+  font-family: inherit;
+  transition: all 0.15s ease;
+}
+
+.model-toggle-btn:hover {
+  color: var(--text-main);
+}
+
+.model-toggle-btn.active {
+  background: rgba(56, 189, 248, 0.22);
+  color: #fff;
+  box-shadow: 0 0 10px rgba(56, 189, 248, 0.25);
+}
+

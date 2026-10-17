@@ -34,6 +34,8 @@ const exportModeSelect = document.getElementById('export-mode-select') as HTMLSe
 
 const backendSelect = document.getElementById('backend-select') as HTMLSelectElement | null;
 const renderModeSelect = document.getElementById('render-mode-select') as HTMLSelectElement;
+const modelV2Btn = document.getElementById('model-v2-btn') as HTMLButtonElement | null;
+const modelV3Btn = document.getElementById('model-v3-btn') as HTMLButtonElement | null;
 const upscaleSelect = document.getElementById('upscale-select') as HTMLSelectElement | null;
 const motionModeSelect = document.getElementById('motion-mode-select') as HTMLSelectElement;
 
@@ -222,6 +224,35 @@ if (backendSelect) {
 renderModeSelect.addEventListener('change', () => {
   viewer.setRenderMode(parseInt(renderModeSelect.value, 10) as RenderMode);
 });
+
+async function setDepthModelVersion(version: 'v2' | 'v3') {
+  if (modelV2Btn && modelV3Btn) {
+    if (version === 'v2') {
+      modelV2Btn.classList.add('active');
+      modelV3Btn.classList.remove('active');
+    } else {
+      modelV3Btn.classList.add('active');
+      modelV2Btn.classList.remove('active');
+    }
+  }
+  viewer.clearExternalDepthMap();
+  await depthController.setModelVersion(version);
+  if (sourceVideo.readyState >= HTMLMediaElement.HAVE_CURRENT_DATA) {
+    depthController.processVideoFrame(sourceVideo, viewer.getBaseDisparity(), 16).catch(() => {});
+  }
+}
+
+if (modelV2Btn) {
+  modelV2Btn.addEventListener('click', () => {
+    setDepthModelVersion('v2');
+  });
+}
+
+if (modelV3Btn) {
+  modelV3Btn.addEventListener('click', () => {
+    setDepthModelVersion('v3');
+  });
+}
 
 if (upscaleSelect) {
   upscaleSelect.addEventListener('change', () => {
@@ -455,10 +486,7 @@ requestAnimationFrame(renderLoop);
     return depthController.inferenceTimeMs;
   },
   hasExternalDepthMap: () => viewer.hasExternalDepthMap(),
-  setDepthModel: (v: 'v3' | 'v2') => {
-    viewer.clearExternalDepthMap();
-    return depthController.setModelVersion(v);
-  },
+  setDepthModel: (v: 'v3' | 'v2') => setDepthModelVersion(v),
   setMotionMode: (mode: 'auto' | 'interactive' | 'manual') => {
     motionMode = mode;
     motionModeSelect.value = mode;
