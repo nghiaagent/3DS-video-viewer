@@ -1,0 +1,16 @@
+{
+  "name": "stereo-disparity",
+  "type": "module",
+  "description": "High-performance stereo disparity estimation for Nintendo 3DS stereoscopic video",
+  "version": "0.1.0",
+  "files": [
+    "stereo_disparity_bg.wasm",
+    "stereo_disparity.js",
+    "stereo_disparity.d.ts"
+  ],
+  "main": "stereo_disparity.js",
+  "types": "stereo_disparity.d.ts",
+  "sideEffects": [
+    "./snippets/*"
+  ]
+}
