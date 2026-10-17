@@ -71,7 +71,7 @@ const motionController = new MotionController(viewportContainer, {
 });
 
 const depthController = new DepthAnythingController(
-  { inputSize: 256, dilateRadius: 5 },
+  { modelVersion: 'v3', inputSize: 504, expandRadius: 1, dilateRadius: 1 },
   (calibratedDepth, width, height, _telemetry) => {
     viewer.uploadExternalDepthMap(calibratedDepth, width, height);
   }
@@ -455,6 +455,10 @@ requestAnimationFrame(renderLoop);
     return depthController.inferenceTimeMs;
   },
   hasExternalDepthMap: () => viewer.hasExternalDepthMap(),
+  setDepthModel: (v: 'v3' | 'v2') => {
+    viewer.clearExternalDepthMap();
+    return depthController.setModelVersion(v);
+  },
   setMotionMode: (mode: 'auto' | 'interactive' | 'manual') => {
     motionMode = mode;
     motionModeSelect.value = mode;

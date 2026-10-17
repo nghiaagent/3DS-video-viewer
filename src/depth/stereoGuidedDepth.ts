@@ -32,6 +32,7 @@ export interface DepthTelemetry {
   fps: number;
   frameId: number;
   anchorCount?: number;
+  modelVersion?: 'v3' | 'v2';
 }
 
 export type DepthMapReadyCallback = (
@@ -272,6 +273,7 @@ export function calibrateDepthWithStereoSBS(
       if (extraOptions.contrastStretch !== undefined) contrastStretch = extraOptions.contrastStretch;
     }
   }
+  void alphaConfidence;
 
   // Infer dimensions if not specified
   if (!sbsWidth || !sbsHeight) {
@@ -660,6 +662,7 @@ export class DepthAnythingController {
     }
     this.modelVersion = version;
     this.options.modelVersion = version;
+    this.options.inputSize = version === 'v2' ? 518 : 504;
 
     const defaultModel = version === 'v3' ? '/models/depthanythingv3.onnx' : '/models/depthanythingv2.onnx';
     const modelPath = typeof window !== 'undefined'
@@ -903,6 +906,7 @@ export class DepthAnythingController {
         fps: Math.round(this.currentFps * 10) / 10,
         frameId: result.frameId || this.frameCounter,
         anchorCount: calResult.anchorCount,
+        modelVersion: this.modelVersion,
       };
 
       this.lastTelemetry = telemetry;
