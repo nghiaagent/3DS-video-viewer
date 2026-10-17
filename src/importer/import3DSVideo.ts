@@ -1,5 +1,6 @@
 import { FFmpeg } from '@ffmpeg/ffmpeg';
 import { fetchFile } from '@ffmpeg/util';
+import { parse3DSMetadata, type ThreeDSMetadata } from './parse3DSMetadata.js';
 
 export interface VideoSourceInput {
   url: string;
@@ -74,7 +75,7 @@ export async function import3DSVideo(
   source: VideoSource,
   videoElement: HTMLVideoElement,
   onProgress?: (stage: string, ratio: number) => void
-): Promise<{ filename: string; format: 'transcoded_avi'; objectUrl: string }> {
+): Promise<{ filename: string; format: 'transcoded_avi'; objectUrl: string; metadata: ThreeDSMetadata }> {
   let fileName = '';
   let ext = '';
 
@@ -108,6 +109,7 @@ export async function import3DSVideo(
   onProgress?.('Fetching AVI file...', 0.2);
   const fileSource = source instanceof File ? source : (typeof window !== 'undefined' ? new URL(source.url, window.location.href).href : source.url);
   const fileData = await fetchFile(fileSource);
+  const metadata = parse3DSMetadata(fileData);
 
   const inputName = `input_${Date.now()}.avi`;
   const outputName = `output_${Date.now()}.mp4`;
@@ -173,6 +175,7 @@ export async function import3DSVideo(
     filename: fileName,
     format: 'transcoded_avi',
     objectUrl,
+    metadata,
   };
 }
 
