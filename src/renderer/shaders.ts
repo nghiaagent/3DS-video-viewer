@@ -178,6 +178,13 @@ void main() {
     vec3 colorR = texture(u_sbsTexture, uvRight).rgb;
 
     vec3 blended = mix(colorL, colorR, t);
+
+    // Apple Vision style subtle edge feathering into dark glass frame
+    vec2 edgeDist = min(v_uv, 1.0 - v_uv);
+    float edgeFactor = clamp(min(edgeDist.x, edgeDist.y) / 0.02, 0.0, 1.0);
+    edgeFactor = smoothstep(0.0, 1.0, edgeFactor);
+    blended *= (0.88 + 0.12 * edgeFactor);
+
     outColor = vec4(blended, 1.0);
 }
 `;

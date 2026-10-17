@@ -30,8 +30,11 @@ export function getPerspectiveShift(
 export class MotionController {
   private element: HTMLElement | null = null;
   private mouseXNormalized: number | null = null;
+  private mouseYNormalized: number | null = null;
   private currentShift: number = 0.5;
   private targetShift: number = 0.5;
+  private currentVerticalTilt: number = 0.0;
+  private targetVerticalTilt: number = 0.0;
   private isHovered: boolean = false;
   private options: Required<MotionOptions>;
 
@@ -91,32 +94,38 @@ export class MotionController {
   private onMouseMove(e: MouseEvent): void {
     if (!this.element) return;
     const rect = this.element.getBoundingClientRect();
-    if (rect.width <= 0) return;
+    if (rect.width <= 0 || rect.height <= 0) return;
 
     this.isHovered = true;
     const normX = (e.clientX - rect.left) / rect.width;
+    const normY = (e.clientY - rect.top) / rect.height;
     this.mouseXNormalized = Math.max(0.0, Math.min(1.0, normX));
+    this.mouseYNormalized = Math.max(0.0, Math.min(1.0, normY));
   }
 
   private onMouseLeave(): void {
     this.isHovered = false;
     this.mouseXNormalized = null;
+    this.mouseYNormalized = null;
   }
 
   private onTouchMove(e: TouchEvent): void {
     if (!this.element || e.touches.length === 0) return;
     const rect = this.element.getBoundingClientRect();
-    if (rect.width <= 0) return;
+    if (rect.width <= 0 || rect.height <= 0) return;
 
     this.isHovered = true;
     const touch = e.touches[0];
     const normX = (touch.clientX - rect.left) / rect.width;
+    const normY = (touch.clientY - rect.top) / rect.height;
     this.mouseXNormalized = Math.max(0.0, Math.min(1.0, normX));
+    this.mouseYNormalized = Math.max(0.0, Math.min(1.0, normY));
   }
 
   private onTouchEnd(): void {
     this.isHovered = false;
     this.mouseXNormalized = null;
+    this.mouseYNormalized = null;
   }
 
   private onDeviceOrientation(e: DeviceOrientationEvent): void {
@@ -128,6 +137,12 @@ export class MotionController {
     // Map [-sensitivity, +sensitivity] to [0.0, 1.0]
     const gyroShift = (clampedGamma / (2.0 * this.options.gyroSensitivity)) + 0.5;
     this.targetShift = Math.max(0.0, Math.min(1.0, gyroShift));
+
+    // beta represents front-to-back tilt in degrees [-180, 180]
+    if (e.beta !== null) {
+      const clampedBeta = Math.max(-this.options.gyroSensitivity, Math.min(this.options.gyroSensitivity, e.beta - 45));
+      this.targetVerticalTilt = -(clampedBeta / this.options.gyroSensitivity);
+    }
   }
 
   /**
@@ -136,13 +151,18 @@ export class MotionController {
   public update(timestampMs: number): number {
     if (this.mouseXNormalized !== null) {
       this.targetShift = this.mouseXNormalized;
+      if (this.mouseYNormalized !== null) {
+        this.targetVerticalTilt = (this.mouseYNormalized - 0.5) * 2.0; // [-1, 1]
+      }
     } else if (!this.isHovered) {
       this.targetShift = getPerspectiveShift(timestampMs, null, this.options);
+      this.targetVerticalTilt = 0.0;
     }
 
     // Exponential smoothing for buttery-smooth 60fps parallax
     const factor = this.options.dampingFactor;
     this.currentShift += (this.targetShift - this.currentShift) * factor;
+    this.currentVerticalTilt += (this.targetVerticalTilt - this.currentVerticalTilt) * factor;
 
     return Math.max(0.0, Math.min(1.0, this.currentShift));
   }
@@ -151,9 +171,15 @@ export class MotionController {
     return this.currentShift;
   }
 
+  public getVerticalTilt(): number {
+    return this.currentVerticalTilt;
+  }
+
   public setManualShift(shift: number): void {
     this.currentShift = Math.max(0.0, Math.min(1.0, shift));
     this.targetShift = this.currentShift;
     this.mouseXNormalized = this.currentShift;
+    this.targetVerticalTilt = 0.0;
+    this.currentVerticalTilt = 0.0;
   }
 }
