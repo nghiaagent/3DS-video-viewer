@@ -78,10 +78,14 @@ export class WebGLParallaxViewer {
   private depthFilterProgram: WebGLProgram | null = null;
   private depthFilterLocs: {
     rawDispTexture: WebGLUniformLocation | null;
+    sbsTexture: WebGLUniformLocation | null;
     dispTexelSize: WebGLUniformLocation | null;
+    windowCrop: WebGLUniformLocation | null;
   } = {
     rawDispTexture: null,
+    sbsTexture: null,
     dispTexelSize: null,
+    windowCrop: null,
   };
 
   // Pass 3: Perspective Window & View Modes (Fullscreen quad for modes 1..5)
@@ -155,9 +159,11 @@ export class WebGLParallaxViewer {
   private pingPongIdx: number = 0;
   private frameCountTotal: number = 0;
 
-  // Filtered Tiefling depth FBO
+  // Filtered Tiefling depth FBOs (Two-pass joint bilateral filter)
   private filteredDispTexture: WebGLTexture | null = null;
   private filteredDispFbo: WebGLFramebuffer | null = null;
+  private tempFilterTexture: WebGLTexture | null = null;
+  private tempFilterFbo: WebGLFramebuffer | null = null;
 
   // Configurations
   private backend: DisparityBackend = 'gpu';
@@ -182,8 +188,8 @@ export class WebGLParallaxViewer {
 
   private eyeWidth: number = 480;
   private eyeHeight: number = 240;
-  private dispWidth: number = 160;
-  private dispHeight: number = 96;
+  private dispWidth: number = 72;
+  private dispHeight: number = 44;
 
   // Offscreen canvas for fast baseline estimation from video elements
   private baselineCanvas: HTMLCanvasElement | OffscreenCanvas | null = null;
@@ -225,7 +231,10 @@ export class WebGLParallaxViewer {
       if (options.backend) this.backend = options.backend;
       if (options.renderMode !== undefined) this.renderMode = options.renderMode;
       if (options.windowCrop !== undefined) this.windowCrop = options.windowCrop;
-      if (options.maxDisp !== undefined) this.maxDisp = options.maxDisp;
+      if (options.maxDisp !== undefined) {
+        this.maxDisp = options.maxDisp;
+        this.meshDepth = 0.15 + (options.maxDisp / 36.0) * 0.65;
+      }
       if (options.baseDisp !== undefined) {
         this.baseDisp = options.baseDisp;
         this.smoothedBaseDisp = options.baseDisp;
@@ -278,7 +287,9 @@ export class WebGLParallaxViewer {
     this.depthFilterProgram = this.createProgram(VERTEX_SHADER_SOURCE, TIEFLING_DEPTH_FILTER_FRAG_SOURCE);
     this.depthFilterLocs = {
       rawDispTexture: gl.getUniformLocation(this.depthFilterProgram, 'u_rawDispTexture'),
+      sbsTexture: gl.getUniformLocation(this.depthFilterProgram, 'u_sbsTexture'),
       dispTexelSize: gl.getUniformLocation(this.depthFilterProgram, 'u_dispTexelSize'),
+      windowCrop: gl.getUniformLocation(this.depthFilterProgram, 'u_windowCrop'),
     };
 
     // Compile Pass 3 (Perspective Window & View Modes)
@@ -390,8 +401,8 @@ export class WebGLParallaxViewer {
     this.eyeWidth = width;
     this.eyeHeight = height;
 
-    this.dispWidth = 160;
-    this.dispHeight = 96;
+    this.dispWidth = 72;
+    this.dispHeight = 44;
 
     for (let i = 0; i < 2; i++) {
       if (!this.dispTextures[i]) {
@@ -419,7 +430,32 @@ export class WebGLParallaxViewer {
       }
     }
 
-    // Allocate filtered depth texture and FBO
+    // Allocate intermediate temporary filter depth texture and FBO (Pass 2A)
+    if (!this.tempFilterTexture) {
+      this.tempFilterTexture = gl.createTexture();
+    }
+    gl.bindTexture(gl.TEXTURE_2D, this.tempFilterTexture);
+    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.LINEAR);
+    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.LINEAR);
+    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_S, gl.CLAMP_TO_EDGE);
+    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE);
+
+    gl.texImage2D(gl.TEXTURE_2D, 0, gl.R8, this.dispWidth, this.dispHeight, 0, gl.RED, gl.UNSIGNED_BYTE, null);
+
+    if (!this.tempFilterFbo) {
+      this.tempFilterFbo = gl.createFramebuffer();
+    }
+    gl.bindFramebuffer(gl.FRAMEBUFFER, this.tempFilterFbo);
+    gl.framebufferTexture2D(gl.FRAMEBUFFER, gl.COLOR_ATTACHMENT0, gl.TEXTURE_2D, this.tempFilterTexture, 0);
+
+    const tStatus = gl.checkFramebufferStatus(gl.FRAMEBUFFER);
+    if (tStatus !== gl.FRAMEBUFFER_COMPLETE) {
+      console.warn(`Temp disparity FBO incomplete with R8 (${tStatus}), falling back to RGBA8`);
+      gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA8, this.dispWidth, this.dispHeight, 0, gl.RGBA, gl.UNSIGNED_BYTE, null);
+      gl.framebufferTexture2D(gl.FRAMEBUFFER, gl.COLOR_ATTACHMENT0, gl.TEXTURE_2D, this.tempFilterTexture, 0);
+    }
+
+    // Allocate final filtered depth texture and FBO (Pass 2B)
     if (!this.filteredDispTexture) {
       this.filteredDispTexture = gl.createTexture();
     }
@@ -516,6 +552,7 @@ export class WebGLParallaxViewer {
 
   public setMaxDisparity(maxDisp: number): void {
     this.maxDisp = maxDisp;
+    this.meshDepth = 0.15 + (maxDisp / 36.0) * 0.65;
   }
 
   public setFlipY(flip: boolean): void {
@@ -906,10 +943,10 @@ export class WebGLParallaxViewer {
     gl.uniform1i(this.dispLocs.prevDispTexture, 1);
 
     gl.uniform2f(this.dispLocs.eyeTexelSize, 1.0 / this.eyeWidth, 1.0 / this.eyeHeight);
-    gl.uniform1i(this.dispLocs.maxDisp, this.maxDisp);
+    gl.uniform1i(this.dispLocs.maxDisp, 16);
     gl.uniform1i(this.dispLocs.baseDisp, this.baseDisp);
 
-    const temporalWeight = this.frameCountTotal > 1 ? 0.70 : 0.0;
+    const temporalWeight = this.frameCountTotal > 1 ? 0.80 : 0.0;
     gl.uniform1f(this.dispLocs.temporalWeight, temporalWeight);
     gl.uniform1f(this.dispLocs.flipY, 0.0); // Pass 1 FBO disparity coordinates match sbsTexture 1:1
 
@@ -920,22 +957,46 @@ export class WebGLParallaxViewer {
     const gl = this.gl;
     const writeIdx = this.pingPongIdx;
 
-    if (!this.filteredDispFbo || !this.depthFilterProgram) return;
-
-    gl.bindFramebuffer(gl.FRAMEBUFFER, this.filteredDispFbo);
-    gl.viewport(0, 0, this.dispWidth, this.dispHeight);
+    if (!this.filteredDispFbo || !this.tempFilterFbo || !this.depthFilterProgram) return;
 
     gl.useProgram(this.depthFilterProgram);
     gl.bindVertexArray(this.vao);
+
+    gl.uniform2f(this.depthFilterLocs.dispTexelSize, 1.0 / this.dispWidth, 1.0 / this.dispHeight);
+    if (this.depthFilterLocs.windowCrop) {
+      gl.uniform1f(this.depthFilterLocs.windowCrop, this.windowCrop);
+    }
+
+    // Pass 2A: dispTextures[writeIdx] -> tempFilterFbo
+    gl.bindFramebuffer(gl.FRAMEBUFFER, this.tempFilterFbo);
+    gl.viewport(0, 0, this.dispWidth, this.dispHeight);
 
     gl.activeTexture(gl.TEXTURE0);
     gl.bindTexture(gl.TEXTURE_2D, this.dispTextures[writeIdx]);
     gl.uniform1i(this.depthFilterLocs.rawDispTexture, 0);
 
-    gl.uniform2f(this.depthFilterLocs.dispTexelSize, 1.0 / this.dispWidth, 1.0 / this.dispHeight);
+    gl.activeTexture(gl.TEXTURE1);
+    gl.bindTexture(gl.TEXTURE_2D, this.sbsTexture);
+    gl.uniform1i(this.depthFilterLocs.sbsTexture, 1);
 
     gl.drawArrays(gl.TRIANGLES, 0, 3);
+
+    // Pass 2B: tempFilterTexture -> filteredDispFbo
+    gl.bindFramebuffer(gl.FRAMEBUFFER, this.filteredDispFbo);
+    gl.viewport(0, 0, this.dispWidth, this.dispHeight);
+
+    gl.activeTexture(gl.TEXTURE0);
+    gl.bindTexture(gl.TEXTURE_2D, this.tempFilterTexture);
+    gl.uniform1i(this.depthFilterLocs.rawDispTexture, 0);
+
+    gl.activeTexture(gl.TEXTURE1);
+    gl.bindTexture(gl.TEXTURE_2D, this.sbsTexture);
+    gl.uniform1i(this.depthFilterLocs.sbsTexture, 1);
+
+    gl.drawArrays(gl.TRIANGLES, 0, 3);
+
     gl.bindFramebuffer(gl.FRAMEBUFFER, null);
+    gl.bindVertexArray(null);
   }
 
   private runPerspectivePass(viewShift: number, customFlipY?: boolean): void {
@@ -1002,7 +1063,7 @@ export class WebGLParallaxViewer {
       gl.uniform1i(this.perspLocs.sbsTexture, 0);
 
       gl.activeTexture(gl.TEXTURE1);
-      gl.bindTexture(gl.TEXTURE_2D, this.dispTextures[currDispIdx]);
+      gl.bindTexture(gl.TEXTURE_2D, this.filteredDispTexture ?? this.dispTextures[currDispIdx]);
       gl.uniform1i(this.perspLocs.dispTexture, 1);
 
       gl.uniform1f(this.perspLocs.viewShift, clampedShift);
@@ -1055,6 +1116,8 @@ export class WebGLParallaxViewer {
     }
     if (this.filteredDispTexture) gl.deleteTexture(this.filteredDispTexture);
     if (this.filteredDispFbo) gl.deleteFramebuffer(this.filteredDispFbo);
+    if (this.tempFilterTexture) gl.deleteTexture(this.tempFilterTexture);
+    if (this.tempFilterFbo) gl.deleteFramebuffer(this.tempFilterFbo);
     if (this.vbo) gl.deleteBuffer(this.vbo);
     if (this.vao) gl.deleteVertexArray(this.vao);
     if (this.meshVbo) gl.deleteBuffer(this.meshVbo);

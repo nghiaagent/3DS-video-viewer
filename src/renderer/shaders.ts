@@ -24,38 +24,64 @@ in vec2 v_uv;
 out vec4 outColor;
 
 uniform sampler2D u_rawDispTexture;
+uniform sampler2D u_sbsTexture;
 uniform vec2 u_dispTexelSize;
+uniform float u_windowCrop;
 
 void main() {
-    // 9-tap Gaussian/box neighborhood samples
+    // Center reference samples
     float dCenter = texture(u_rawDispTexture, v_uv).r;
-    float dL  = texture(u_rawDispTexture, v_uv - vec2(u_dispTexelSize.x, 0.0)).r;
-    float dR  = texture(u_rawDispTexture, v_uv + vec2(u_dispTexelSize.x, 0.0)).r;
-    float dU  = texture(u_rawDispTexture, v_uv + vec2(0.0, u_dispTexelSize.y)).r;
-    float dD  = texture(u_rawDispTexture, v_uv - vec2(0.0, u_dispTexelSize.y)).r;
-    float dUL = texture(u_rawDispTexture, v_uv + vec2(-u_dispTexelSize.x, u_dispTexelSize.y)).r;
-    float dUR = texture(u_rawDispTexture, v_uv + vec2(u_dispTexelSize.x, u_dispTexelSize.y)).r;
-    float dDL = texture(u_rawDispTexture, v_uv + vec2(-u_dispTexelSize.x, -u_dispTexelSize.y)).r;
-    float dDR = texture(u_rawDispTexture, v_uv + vec2(u_dispTexelSize.x, -u_dispTexelSize.y)).r;
+    vec3 centerColor = texture(u_sbsTexture, vec2(v_uv.x * 0.5, v_uv.y)).rgb;
 
-    float avg9 = (dCenter * 4.0 + (dL + dR + dU + dD) * 2.0 + (dUL + dUR + dDL + dDR) * 1.0) / 16.0;
-
-    // Foreground max-dilation neighborhood search (radius 3)
+    // Radius 2 (5x5) Foreground max-dilation
     float maxDilated = dCenter;
-    for (int dy = -3; dy <= 3; dy++) {
-        for (int dx = -3; dx <= 3; dx++) {
-            if (dx * dx + dy * dy <= 10) {
+    for (int dy = -2; dy <= 2; dy++) {
+        for (int dx = -2; dx <= 2; dx++) {
+            if (dx * dx + dy * dy <= 5) {
                 float sampleD = texture(u_rawDispTexture, v_uv + vec2(float(dx), float(dy)) * u_dispTexelSize).r;
                 maxDilated = max(maxDilated, sampleD);
             }
         }
     }
 
-    // Steep-gradient detection and silhouette dilation
-    float gradientMag = abs(dR - dL) + abs(dU - dD);
-    float smoothedDilated = mix(maxDilated, avg9, 0.35);
+    // Wide 9x9 ([-4..4]) Joint Bilateral Filter with Gaussian spatial + color similarity
+    // sigma_spatial = 2.0 -> 2 * sigma_spatial^2 = 8.0
+    // sigma_color = 0.18 -> 2 * sigma_color^2 = 0.0648
+    const float twoSigmaSpatialSq = 8.0;
+    const float twoSigmaColorSq = 0.0648;
 
-    float outDepth = avg9;
+    float sumWeights = 0.0;
+    float sumFilteredD = 0.0;
+
+    for (int dy = -4; dy <= 4; dy++) {
+        for (int dx = -4; dx <= 4; dx++) {
+            vec2 offsetUV = clamp(v_uv + vec2(float(dx), float(dy)) * u_dispTexelSize, 0.001, 0.999);
+            float sampleD = texture(u_rawDispTexture, offsetUV).r;
+            vec3 sampleColor = texture(u_sbsTexture, vec2(offsetUV.x * 0.5, offsetUV.y)).rgb;
+
+            float spatialDistSq = float(dx * dx + dy * dy);
+            vec3 colorDiff = sampleColor - centerColor;
+            float colorDistSq = dot(colorDiff, colorDiff);
+
+            float weight = exp(-spatialDistSq / twoSigmaSpatialSq) * exp(-colorDistSq / twoSigmaColorSq);
+
+            sumFilteredD += sampleD * weight;
+            sumWeights += weight;
+        }
+    }
+
+    float bilateralD = sumFilteredD / max(1e-4, sumWeights);
+
+    // Gradient magnitude detection for silhouette preservation
+    float dL  = texture(u_rawDispTexture, v_uv - vec2(u_dispTexelSize.x, 0.0)).r;
+    float dR  = texture(u_rawDispTexture, v_uv + vec2(u_dispTexelSize.x, 0.0)).r;
+    float dU  = texture(u_rawDispTexture, v_uv + vec2(0.0, u_dispTexelSize.y)).r;
+    float dD  = texture(u_rawDispTexture, v_uv - vec2(0.0, u_dispTexelSize.y)).r;
+    float gradientMag = abs(dR - dL) + abs(dU - dD);
+
+    float smoothedDilated = mix(maxDilated, bilateralD, 0.35);
+
+    float outDepth = bilateralD;
     if (gradientMag > 0.08) {
         outDepth = smoothedDilated;
     }
@@ -131,9 +157,9 @@ out vec4 outColor;
 uniform sampler2D u_sbsTexture;
 uniform sampler2D u_prevDispTexture;
 uniform vec2 u_eyeTexelSize;     // Full-res eye texel size e.g. vec2(1.0 / 480.0, 1.0 / 240.0)
-uniform int u_maxDisp;           // Search radius e.g. 16 or 20
+uniform int u_maxDisp;           // Search radius e.g. 16
 uniform int u_baseDisp;          // Convergence baseline offset e.g. 8 (range [-80, 24])
-uniform float u_temporalWeight; // Temporal stabilization weight e.g. 0.70
+uniform float u_temporalWeight; // Temporal stabilization weight e.g. 0.80
 
 float getLuma(vec3 rgb) {
     return dot(rgb, vec3(0.299, 0.587, 0.114));
@@ -155,56 +181,74 @@ void main() {
     vec3 centerColorL = texture(u_sbsTexture, vec2(uv.x * 0.5, uv.y)).rgb;
     float centerLumaL = getLuma(centerColorL);
 
-    // Compute Left 3x3 center mean luminance for ZSAD
+    // Sample 5x5 macro-block window in Left eye (wy: -6..+6 step 3, wx: -8..+8 step 4)
+    // aggregates a 17x13 pixel region of the 3DS eye
+    float lumaL[25];
     float sumMeanL = 0.0;
-    for (int cy = -1; cy <= 1; cy++) {
-        float yOff = clamp(uv.y + float(cy) * u_eyeTexelSize.y, 0.01, 0.99);
-        for (int cx = -1; cx <= 1; cx++) {
-            float lx = clamp((uv.x + float(cx) * u_eyeTexelSize.x) * 0.5, 0.002, 0.498);
-            sumMeanL += getLuma(texture(u_sbsTexture, vec2(lx, yOff)).rgb);
+    int sIdx = 0;
+    for (int wy = -6; wy <= 6; wy += 3) {
+        float yOff = clamp(uv.y + float(wy) * u_eyeTexelSize.y, 0.01, 0.99);
+        for (int wx = -8; wx <= 8; wx += 4) {
+            float lx = clamp((uv.x + float(wx) * u_eyeTexelSize.x) * 0.5, 0.002, 0.498);
+            float l = getLuma(texture(u_sbsTexture, vec2(lx, yOff)).rgb);
+            lumaL[sIdx] = l;
+            sumMeanL += l;
+            sIdx++;
         }
     }
-    float meanL = sumMeanL / 9.0;
+    float meanL = sumMeanL / 25.0;
 
-    float bestSAD = 1e6;
-    int bestD = u_baseDisp;
+    // Local texture energy / variance across the macro-block
+    float gradEnergy = 0.0;
+    for (int i = 0; i < 25; i++) {
+        gradEnergy += abs(lumaL[i] - meanL);
+    }
 
     // Search d around u_baseDisp in [u_baseDisp - u_maxDisp, u_baseDisp + u_maxDisp]
     int startD = u_baseDisp - u_maxDisp;
     int endD = u_baseDisp + u_maxDisp;
+    int numCandidates = endD - startD + 1;
+
+    const int MAX_CANDIDATES = 65;
+    float costs[MAX_CANDIDATES];
+
+    float bestSAD = 1e6;
+    int bestD = u_baseDisp;
 
     for (int d = startD; d <= endD; ++d) {
-        float cost = 0.0;
+        int candIdx = d - startD;
+        if (candIdx >= MAX_CANDIDATES) break;
+
         float rightCenterLuma = getLuma(texture(u_sbsTexture, vec2(0.5 + clamp((uv.x - float(d) * u_eyeTexelSize.x) * 0.5, 0.002, 0.498), uv.y)).rgb);
 
-        // Compute Right 3x3 center mean luminance at offset d for ZSAD
+        // Compute Right eye patch samples & mean for ZSAD
         float sumMeanR = 0.0;
-        for (int cy = -1; cy <= 1; cy++) {
-            float yOff = clamp(uv.y + float(cy) * u_eyeTexelSize.y, 0.01, 0.99);
-            for (int cx = -1; cx <= 1; cx++) {
-                float rx = 0.5 + clamp((uv.x + float(cx - d) * u_eyeTexelSize.x) * 0.5, 0.002, 0.498);
-                sumMeanR += getLuma(texture(u_sbsTexture, vec2(rx, yOff)).rgb);
+        float lumaR[25];
+        int rIdx = 0;
+        for (int wy = -6; wy <= 6; wy += 3) {
+            float yOff = clamp(uv.y + float(wy) * u_eyeTexelSize.y, 0.01, 0.99);
+            for (int wx = -8; wx <= 8; wx += 4) {
+                float rx = 0.5 + clamp((uv.x + float(wx - d) * u_eyeTexelSize.x) * 0.5, 0.002, 0.498);
+                float l = getLuma(texture(u_sbsTexture, vec2(rx, yOff)).rgb);
+                lumaR[rIdx] = l;
+                sumMeanR += l;
+                rIdx++;
             }
         }
-        float meanR = sumMeanR / 9.0;
+        float meanR = sumMeanR / 25.0;
         float lumaDiff = meanL - meanR;
 
-        // 9x7 patch matching sampling full-res u_sbsTexture
-        for (int wy = -3; wy <= 3; wy += 2) {
-            float yOffset = clamp(uv.y + float(wy) * u_eyeTexelSize.y, 0.01, 0.99);
+        // Aggregate ZSAD + census across 5x5 window
+        float cost = 0.0;
+        int pIdx = 0;
+        for (int wy = -6; wy <= 6; wy += 3) {
+            for (int wx = -8; wx <= 8; wx += 4) {
+                float lL = lumaL[pIdx];
+                float lR = lumaR[pIdx];
+                pIdx++;
 
-            for (int wx = -4; wx <= 4; wx += 2) {
-                float lx = clamp((uv.x + float(wx) * u_eyeTexelSize.x) * 0.5, 0.002, 0.498);
-                float rx = 0.5 + clamp((uv.x + float(wx - d) * u_eyeTexelSize.x) * 0.5, 0.002, 0.498);
-
-                vec3 rgbL = texture(u_sbsTexture, vec2(lx, yOffset)).rgb;
-                vec3 rgbR = texture(u_sbsTexture, vec2(rx, yOffset)).rgb;
-
-                float lL = getLuma(rgbL);
-                float lR = getLuma(rgbR);
-
-                // Center-weighted kernel
-                float weight = (wx == 0 && wy == 0) ? 2.0 : ((abs(wx) <= 2 && abs(wy) <= 1) ? 1.4 : 0.85);
+                // Center-weighted Gaussian spatial kernel
+                float weight = (wx == 0 && wy == 0) ? 2.0 : ((abs(wx) <= 4 && abs(wy) <= 3) ? 1.4 : 0.85);
 
                 // Zero-Mean SAD (ZSAD) + illumination-invariant census term
                 float sadTerm = abs((lL - lR) - lumaDiff);
@@ -213,20 +257,56 @@ void main() {
             }
         }
 
+        // Quadratic smoothness prior toward u_baseDisp to penalize extreme deviations on flat regions
+        float priorPenalty = 0.0015 * float((d - u_baseDisp) * (d - u_baseDisp));
+        cost += priorPenalty;
+
+        costs[candIdx] = cost;
+
         if (cost < bestSAD) {
             bestSAD = cost;
             bestD = d;
         }
     }
 
+    // Find second best SAD outside the immediate 1-pixel neighborhood of bestD
+    int bestIdx = bestD - startD;
+    float secondBestSAD = 1e6;
+    for (int i = 0; i < MAX_CANDIDATES; ++i) {
+        if (i >= numCandidates) break;
+        if (abs(i - bestIdx) > 1) {
+            if (costs[i] < secondBestSAD) {
+                secondBestSAD = costs[i];
+            }
+        }
+    }
+    if (secondBestSAD > 1e5) {
+        secondBestSAD = bestSAD * 1.5;
+    }
+
+    // Subpixel parabolic interpolation using costMinus (bestD - 1) and costPlus (bestD + 1)
+    float costMinus = (bestIdx > 0) ? costs[bestIdx - 1] : bestSAD;
+    float costPlus = (bestIdx < numCandidates - 1 && bestIdx + 1 < MAX_CANDIDATES) ? costs[bestIdx + 1] : bestSAD;
+
+    float denom = 2.0 * (costMinus + costPlus - 2.0 * bestSAD);
+    float subpixelD = float(bestD) + ((denom > 1e-4) ? clamp((costMinus - costPlus) / denom, -0.5, 0.5) : 0.0);
+
     // Normalized disparity: 0.5 represents convergence at u_baseDisp
-    float normD = clamp(float(bestD - startD) / float(max(1, endD - startD)), 0.0, 1.0);
+    float normD = clamp((subpixelD - float(startD)) / float(max(1, endD - startD)), 0.0, 1.0);
+
+    // Uniqueness & Texture confidence weighting
+    float uniqueness = clamp((secondBestSAD - bestSAD) / max(bestSAD, 0.05), 0.0, 1.0);
+    float texConf = smoothstep(0.08, 0.35, gradEnergy);
+    float conf = clamp(uniqueness * texConf, 0.0, 1.0);
+
+    // Ambiguous or flat regions smoothly revert to 0.5 convergence plane
+    normD = mix(0.5, normD, conf);
 
     // Ping-pong temporal stabilization
     if (u_temporalWeight > 0.01) {
         float prevD = texture(u_prevDispTexture, v_uv).r;
         if (prevD > 0.001 && prevD < 0.999) {
-            normD = mix(normD, prevD, clamp(u_temporalWeight, 0.0, 0.75));
+            normD = mix(normD, prevD, clamp(u_temporalWeight, 0.0, 0.85));
         }
     }
 
