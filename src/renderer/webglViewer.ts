@@ -554,11 +554,13 @@ export class WebGLParallaxViewer {
     return this.meshDepth;
   }
 
-  public setThreeDSMetadata(parallaxOffset: number, estimatedBaseDisp: number): void {
+  public setThreeDSMetadata(parallaxOffset: number, estimatedBaseDisp: number | null): void {
     this.parallaxOffset = parallaxOffset;
     this.metadataBaseDisp = estimatedBaseDisp;
-    this.baseDisp = estimatedBaseDisp;
-    this.smoothedBaseDisp = estimatedBaseDisp;
+    if (estimatedBaseDisp !== null && Number.isFinite(estimatedBaseDisp)) {
+      this.baseDisp = estimatedBaseDisp;
+      this.smoothedBaseDisp = estimatedBaseDisp;
+    }
   }
 
   public getThreeDSMetadata(): { parallaxOffset: number | null; estimatedBaseDisp: number | null } {
@@ -692,7 +694,7 @@ export class WebGLParallaxViewer {
     // Clamp to valid 3DS hardware stereo baseline range [-80, 24]
     const clamped = Math.max(-80, Math.min(24, detected));
 
-    if (this.frameCountTotal <= 1) {
+    if (this.frameCountTotal <= 1 && this.metadataBaseDisp === null) {
       this.smoothedBaseDisp = clamped;
     } else {
       this.smoothedBaseDisp = 0.8 * this.smoothedBaseDisp + 0.2 * clamped;
@@ -733,7 +735,7 @@ export class WebGLParallaxViewer {
         const scaled = Math.round(detectedHalf * scale);
         const clamped = Math.max(-80, Math.min(24, scaled));
 
-        if (this.frameCountTotal <= 1) {
+        if (this.frameCountTotal <= 1 && this.metadataBaseDisp === null) {
           this.smoothedBaseDisp = clamped;
         } else {
           this.smoothedBaseDisp = 0.8 * this.smoothedBaseDisp + 0.2 * clamped;
@@ -750,8 +752,12 @@ export class WebGLParallaxViewer {
    */
   public async renderVideoFrame(
     video: TexImageSource,
-    viewShift: number = 0.5
+    viewShift: number = 0.5,
+    verticalTilt?: number
   ): Promise<ViewerTelemetry> {
+    if (verticalTilt !== undefined) {
+      this.setVerticalTilt(verticalTilt);
+    }
     const gl = this.gl;
     const startTotal = performance.now();
     this.frameCountTotal++;
@@ -825,8 +831,12 @@ export class WebGLParallaxViewer {
     sbsWidth: number,
     sbsHeight: number,
     viewShift: number = 0.5,
-    customFlipY?: boolean
+    customFlipY?: boolean,
+    verticalTilt?: number
   ): ViewerTelemetry {
+    if (verticalTilt !== undefined) {
+      this.setVerticalTilt(verticalTilt);
+    }
     const gl = this.gl;
     const startTotal = performance.now();
     this.frameCountTotal++;

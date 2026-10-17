@@ -100,10 +100,15 @@ async function loadVideo(source: VideoSource) {
     const result = await import3DSVideo(source, sourceVideo, (stage, ratio) => {
       setImportProgress(stage, ratio);
     });
+    if (result.metadata && result.metadata.found) {
+      viewer.setThreeDSMetadata(result.metadata.parallaxOffset, result.metadata.estimatedBaseDisp);
+    } else {
+      viewer.setThreeDSMetadata(0, null as any);
+    }
     if (emptyStateOverlay) {
       emptyStateOverlay.classList.add('hidden');
     }
-    console.log('[ViewerApp] Loaded video:', result.filename, result.format);
+    console.log('[ViewerApp] Loaded video:', result.filename, result.format, result.metadata);
   } catch (err: unknown) {
     const msg = err instanceof Error ? err.message : String(err);
     console.error('[ViewerApp] Failed to load video:', msg);
@@ -385,7 +390,8 @@ function renderLoop(timestampMs: number) {
 
   // Render on WebGL2 GPU
   if (sourceVideo.readyState >= HTMLMediaElement.HAVE_CURRENT_DATA && !isExporting) {
-    viewer.renderVideoFrame(sourceVideo, viewShift);
+    const verticalTilt = motionController.getVerticalTilt();
+    viewer.renderVideoFrame(sourceVideo, viewShift, verticalTilt);
   }
 
   // Update Telemetry if elements are queried by automated tests

@@ -80,15 +80,15 @@ test.describe('Spatial 3DS Video Viewer E2E Suite (HNI_0062.AVI)', () => {
       return app && app.videoElement && app.videoElement.readyState >= 2 && app.videoElement.currentTime > 0;
     }, { timeout: 45_000 });
 
-    // 7. Verify Auto-Calibrated Global Baseline Convergence locks around -72px
+    // 7. Verify Auto-Calibrated Global Baseline Convergence locks around -70 to -72px via 3DS1 metadata
     await page.waitForTimeout(600); // Allow 4-frame auto-convergence loop
     const telemetry = await page.evaluate(() => {
       const app = (window as any).__viewerApp;
       return app.viewer.getTelemetry();
     });
     console.log('HNI_0062.AVI Auto-Convergence Telemetry:', telemetry);
-    expect(telemetry.baseDisp).toBeLessThanOrEqual(16);
-    expect(telemetry.baseDisp).toBeGreaterThanOrEqual(-4);
+    expect(telemetry.baseDisp).toBeLessThanOrEqual(-60);
+    expect(telemetry.baseDisp).toBeGreaterThanOrEqual(-80);
 
     // 8. Verify upright render (flipY: true) produces active non-black center pixels
     const pixelCheck = await page.evaluate(() => {

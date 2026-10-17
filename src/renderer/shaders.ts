@@ -1,5 +1,6 @@
 export const VERTEX_SHADER_SOURCE = `#version 300 es
 precision highp float;
+precision highp int;
 
 in vec2 a_position;
 out vec2 v_uv;
@@ -17,6 +18,7 @@ void main() {
 
 export const TIEFLING_DEPTH_FILTER_FRAG_SOURCE = `#version 300 es
 precision highp float;
+precision highp int;
 
 in vec2 v_uv;
 out vec4 outColor;
@@ -64,6 +66,7 @@ void main() {
 
 export const TIEFLING_MESH_VERTEX_SHADER_SOURCE = `#version 300 es
 precision highp float;
+precision highp int;
 
 in vec2 a_uv;
 out vec2 v_uv;
@@ -120,6 +123,7 @@ void main() {
 
 export const DISPARITY_SAD_FRAG_SOURCE = `#version 300 es
 precision highp float;
+precision highp int;
 
 in vec2 v_uv;
 out vec4 outColor;
@@ -232,6 +236,7 @@ void main() {
 
 export const PERSPECTIVE_WINDOW_FRAG_SOURCE = `#version 300 es
 precision highp float;
+precision highp int;
 
 in vec2 v_uv;
 out vec4 outColor;
