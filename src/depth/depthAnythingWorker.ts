@@ -12,6 +12,7 @@ export interface WorkerInferMessage {
   type: 'infer';
   frameId?: number;
   rgbaData: Uint8Array;
+  rightRgbaData?: Uint8Array;
   width: number;
   height: number;
   size?: number; // model input resolution, default 504 (multiple of 14: 36 * 14)
@@ -20,8 +21,13 @@ export interface WorkerInferMessage {
 export interface WorkerDepthResultMessage {
   type: 'depthReady';
   frameId?: number;
-  rawDepth: Float32Array; // normalized [0, 1], resampled to original width x height
+  rawDepth: Float32Array; // View 0 (left) normalized [0, 1], resampled to original width x height
+  rawRightDepth?: Float32Array; // View 1 (right) normalized [0, 1]
+  conf0?: Float32Array;
+  conf1?: Float32Array;
   modelDepth?: Float32Array;
+  confidence?: Float32Array;
+  numViews?: number;
   width: number;
   height: number;
   backend: 'webgpu' | 'wasm';
@@ -279,8 +285,8 @@ export async function initSession(options: {
 }
 
 /**
- * Runs inference on raw RGBA Left eye pixels using an active session.
- * Supports both DepthAnythingV3 (rank 5 [1, 1, 3, H, W], 'pixel_values', 'predicted_depth')
+ * Runs inference on raw RGBA Left eye (and optional Right eye) pixels using an active session.
+ * Supports both DepthAnythingV3 (rank 5 [1, 2, 3, H, W] for 2-view multi-view stereo or [1, 1, 3, H, W] for mono)
  * and DepthAnythingV2 (rank 4 [1, 3, H, W], 'image', 'depth').
  */
 export async function runDepthInference(
@@ -288,26 +294,57 @@ export async function runDepthInference(
   rgbaData: Uint8Array,
   width: number,
   height: number,
-  size: number = 504
-): Promise<{ rawDepth: Float32Array; inferenceTimeMs: number }> {
-  const { planarData, letterbox } = preprocessRgbaToPlanarTensor(rgbaData, width, height, size, true);
+  size: number = 504,
+  rightRgbaData?: Uint8Array
+): Promise<{
+  rawDepth: Float32Array;
+  rawRightDepth?: Float32Array;
+  conf0?: Float32Array;
+  conf1?: Float32Array;
+  confidence?: Float32Array;
+  numViews: number;
+  inferenceTimeMs: number;
+}> {
+  const { planarData: leftPlanar, letterbox } = preprocessRgbaToPlanarTensor(rgbaData, width, height, size, true);
 
   const inputName = session.inputNames[0] || 'pixel_values';
-  const isRank5 = inputName === 'pixel_values';
-  const inputTensor = isRank5
-    ? new ort.Tensor('float32', planarData, [1, 1, 3, size, size])
-    : new ort.Tensor('float32', planarData, [1, 3, size, size]);
+  const isV3 = inputName === 'pixel_values';
+
+  let inputTensor: ort.Tensor;
+  let numViews = 1;
+
+  if (isV3 && rightRgbaData) {
+    // Multi-view stereo forward pass for DepthAnything V3: [1, 2, 3, size, size]
+    const { planarData: rightPlanar } = preprocessRgbaToPlanarTensor(rightRgbaData, width, height, size, true);
+    const stereoPlanar = new Float32Array(2 * 3 * size * size);
+    stereoPlanar.set(leftPlanar, 0);
+    stereoPlanar.set(rightPlanar, 3 * size * size);
+    inputTensor = new ort.Tensor('float32', stereoPlanar, [1, 2, 3, size, size]);
+    numViews = 2;
+  } else if (isV3) {
+    inputTensor = new ort.Tensor('float32', leftPlanar, [1, 1, 3, size, size]);
+    numViews = 1;
+  } else {
+    // Monocular rank 4 [1, 3, H, W] for DepthAnything V2
+    inputTensor = new ort.Tensor('float32', leftPlanar, [1, 3, size, size]);
+    numViews = 1;
+  }
 
   const t0 = performance.now();
   let results: Record<string, ort.Tensor>;
   try {
     results = await session.run({ [inputName]: inputTensor });
   } catch (err: any) {
-    if (err && String(err.message).includes('Expected: 5')) {
-      const tensor5D = new ort.Tensor('float32', planarData, [1, 1, 3, size, size]);
+    if (numViews === 2) {
+      console.warn('DepthAnythingWorker: 2-view stereo run failed, falling back to 1-view:', err?.message || err);
+      const singleViewTensor = new ort.Tensor('float32', leftPlanar, [1, 1, 3, size, size]);
+      results = await session.run({ [inputName]: singleViewTensor });
+      numViews = 1;
+    } else if (err && String(err.message).includes('Expected: 5')) {
+      const tensor5D = new ort.Tensor('float32', leftPlanar, [1, 1, 3, size, size]);
       results = await session.run({ [inputName]: tensor5D });
     } else if (err && String(err.message).includes('Expected: 4')) {
-      const tensor4D = new ort.Tensor('float32', planarData, [1, 3, size, size]);
+      const tensor4D = new ort.Tensor('float32', leftPlanar, [1, 3, size, size]);
       results = await session.run({ [inputName]: tensor4D });
     } else {
       throw err;
@@ -330,14 +367,46 @@ export async function runDepthInference(
   const dims = outputTensor.dims;
   const modelH = dims.length >= 2 ? dims[dims.length - 2] : size;
   const modelW = dims.length >= 2 ? dims[dims.length - 1] : size;
+  const viewElements = modelH * modelW;
 
   const tensorData = outputTensor.data as Float32Array;
-  const rawDepth = postprocessDepthTensor(tensorData, modelW, modelH, width, height, {
+  // View 0 is Left Eye [0, viewElements)
+  const leftDepthData = numViews > 1 ? tensorData.subarray(0, viewElements) : tensorData;
+
+  const rawDepth = postprocessDepthTensor(leftDepthData, modelW, modelH, width, height, {
     ...letterbox,
     inputSize: size,
   });
 
-  return { rawDepth, inferenceTimeMs };
+  let rawRightDepth: Float32Array | undefined;
+  if (numViews > 1) {
+    const rightDepthData = tensorData.subarray(viewElements, 2 * viewElements);
+    rawRightDepth = postprocessDepthTensor(rightDepthData, modelW, modelH, width, height, {
+      ...letterbox,
+      inputSize: size,
+    });
+  }
+
+  let conf0: Float32Array | undefined;
+  let conf1: Float32Array | undefined;
+  if (results['confidence']) {
+    const confTensor = results['confidence'];
+    const confData = confTensor.data as Float32Array;
+    const leftConf = numViews > 1 ? confData.subarray(0, viewElements) : confData;
+    conf0 = postprocessDepthTensor(leftConf, modelW, modelH, width, height, {
+      ...letterbox,
+      inputSize: size,
+    });
+    if (numViews > 1) {
+      const rightConf = confData.subarray(viewElements, 2 * viewElements);
+      conf1 = postprocessDepthTensor(rightConf, modelW, modelH, width, height, {
+        ...letterbox,
+        inputSize: size,
+      });
+    }
+  }
+
+  return { rawDepth, rawRightDepth, conf0, conf1, confidence: conf0, numViews, inferenceTimeMs };
 }
 
 // Web Worker message listener (only active in worker execution context)
@@ -362,26 +431,42 @@ if (typeof self !== 'undefined' && typeof (self as any).postMessage === 'functio
           throw new Error('DepthAnythingWorker not initialized');
         }
         const inputSize = data.size || 504;
-        const { rawDepth, inferenceTimeMs } = await runDepthInference(
+        const { rawDepth, rawRightDepth, conf0, conf1, confidence, numViews, inferenceTimeMs } = await runDepthInference(
           cachedSession,
           data.rgbaData,
           data.width,
           data.height,
-          inputSize
+          inputSize,
+          data.rightRgbaData
         );
 
         const response: WorkerDepthResultMessage = {
           type: 'depthReady',
           frameId: data.frameId,
           rawDepth,
+          rawRightDepth,
+          conf0,
+          conf1,
+          confidence,
+          numViews,
           width: data.width,
           height: data.height,
           backend: cachedBackend,
           inferenceTimeMs,
         };
 
-        // Transfer rawDepth buffer for zero-copy IPC
-        (self as any).postMessage(response, [rawDepth.buffer]);
+        // Transfer rawDepth (and optional buffers) for zero-copy IPC
+        const transferables: Transferable[] = [rawDepth.buffer];
+        if (rawRightDepth) {
+          transferables.push(rawRightDepth.buffer);
+        }
+        if (conf0) {
+          transferables.push(conf0.buffer);
+        }
+        if (conf1) {
+          transferables.push(conf1.buffer);
+        }
+        (self as any).postMessage(response, transferables);
       } catch (err: unknown) {
         const msg = err instanceof Error ? err.message : String(err);
         (self as any).postMessage({ type: 'error', frameId: data.frameId, error: msg });
@@ -389,3 +474,5 @@ if (typeof self !== 'undefined' && typeof (self as any).postMessage === 'functio
     }
   };
 }
+
+

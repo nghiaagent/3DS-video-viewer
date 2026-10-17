@@ -6,6 +6,7 @@ import {
   expandDepthMap,
   resampleDepthMap,
   extractLeftEyeRgba,
+  extractRightEyeRgba,
   computeZeroMeanSAD,
   DepthAnythingController,
 } from '../../src/depth/stereoGuidedDepth.js';
@@ -501,10 +502,18 @@ describe('stereoGuidedDepth & DepthAnything Integration', () => {
       wasmPaths,
       preferWebGPU: false,
     });
-    const inferV3 = await runDepthInference(sessionV3, leftRgba, w, h, 504);
-    expect(inferV3.rawDepth.length).toBe(w * h);
+    const rightRgba = extractRightEyeRgba(sbsRgba, w * 2, h);
 
-    const calV3 = calibrateDepthWithStereoSBS(inferV3.rawDepth, sbsRgba, -70, 16, w * 2, h, { expandRadius: 1 });
+    // 1. Run DepthAnythingV3 multi-view stereo inference with both Left and Right views
+    const inferV3 = await runDepthInference(sessionV3, leftRgba, w, h, 504, rightRgba);
+    expect(inferV3.rawDepth.length).toBe(w * h);
+    expect(inferV3.numViews).toBe(2);
+    const calV3 = calibrateDepthWithStereoSBS(inferV3.rawDepth, sbsRgba, -70, 16, w * 2, h, {
+      expandRadius: 1,
+      rightDaDepth: inferV3.rawRightDepth,
+      conf0: inferV3.conf0,
+      conf1: inferV3.conf1,
+    });
     expect(calV3.width).toBe(w);
     expect(calV3.height).toBe(h);
     expect(calV3.anchorCount).toBeGreaterThan(50);
@@ -520,7 +529,7 @@ describe('stereoGuidedDepth & DepthAnything Integration', () => {
     expect(minV3).toBeLessThanOrEqual(25);
     expect(maxV3).toBeGreaterThanOrEqual(230);
 
-    // 2. Run DepthAnythingV2 inference at 504px
+    // 2. Run DepthAnythingV2 inference at 504px (monocular)
     const { session: sessionV2 } = await initSession({
       modelPath: v2Path,
       wasmPaths,
@@ -528,6 +537,7 @@ describe('stereoGuidedDepth & DepthAnything Integration', () => {
     });
     const inferV2 = await runDepthInference(sessionV2, leftRgba, w, h, 504);
     expect(inferV2.rawDepth.length).toBe(w * h);
+    expect(inferV2.numViews).toBe(1);
 
     const calV2 = calibrateDepthWithStereoSBS(inferV2.rawDepth, sbsRgba, -70, 16, w * 2, h, { expandRadius: 1 });
     expect(calV2.width).toBe(w);

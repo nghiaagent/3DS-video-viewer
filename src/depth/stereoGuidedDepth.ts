@@ -10,6 +10,9 @@ export interface CalibrateDepthOptions {
   expandRadius?: number;
   alphaConfidence?: number;
   contrastStretch?: boolean;
+  rightDaDepth?: Float32Array;
+  conf0?: Float32Array;
+  conf1?: Float32Array;
 }
 
 export interface CalibrateDepthResult {
@@ -33,6 +36,7 @@ export interface DepthTelemetry {
   frameId: number;
   anchorCount?: number;
   modelVersion?: 'v3' | 'v2';
+  numViews?: number;
 }
 
 export type DepthMapReadyCallback = (
@@ -62,7 +66,8 @@ export interface DepthAnythingControllerOptions {
     leftRgba: Uint8Array,
     width: number,
     height: number,
-    size: number
+    size: number,
+    rightRgba?: Uint8Array
   ) => Promise<{ rawDepth: Float32Array; backend: 'webgpu' | 'wasm'; inferenceTimeMs: number }>;
 }
 
@@ -86,6 +91,28 @@ export function extractLeftEyeRgba(
   }
 
   return leftRgba;
+}
+
+/**
+ * Extracts Right Eye RGBA buffer from an SBS RGBA frame.
+ * For an SBS frame with total sbsWidth, Right eye is [sbsWidth/2, sbsWidth).
+ */
+export function extractRightEyeRgba(
+  sbsRgba: Uint8Array,
+  sbsWidth: number,
+  sbsHeight: number
+): Uint8Array {
+  const eyeWidth = Math.floor(sbsWidth / 2);
+  const rightRgba = new Uint8Array(eyeWidth * sbsHeight * 4);
+
+  for (let y = 0; y < sbsHeight; y++) {
+    const sbsRowStart = (y * sbsWidth + eyeWidth) * 4;
+    const eyeRowStart = y * eyeWidth * 4;
+    const eyeRowBytes = eyeWidth * 4;
+    rightRgba.set(sbsRgba.subarray(sbsRowStart, sbsRowStart + eyeRowBytes), eyeRowStart);
+  }
+
+  return rightRgba;
 }
 
 /**
@@ -251,6 +278,9 @@ export function calibrateDepthWithStereoSBS(
   let expandRadius = 1;
   let alphaConfidence = 0.0;
   let contrastStretch = true;
+  let rightDaDepth: Float32Array | undefined;
+  let conf0: Float32Array | undefined;
+  let conf1: Float32Array | undefined;
 
   if (typeof baseDispOrOptions === 'object') {
     const opts = baseDispOrOptions;
@@ -263,6 +293,9 @@ export function calibrateDepthWithStereoSBS(
     if (opts.expandRadius !== undefined) expandRadius = opts.expandRadius;
     if (opts.alphaConfidence !== undefined) alphaConfidence = opts.alphaConfidence;
     if (opts.contrastStretch !== undefined) contrastStretch = opts.contrastStretch;
+    if (opts.rightDaDepth !== undefined) rightDaDepth = opts.rightDaDepth;
+    if (opts.conf0 !== undefined) conf0 = opts.conf0;
+    if (opts.conf1 !== undefined) conf1 = opts.conf1;
   } else {
     baseDisp = baseDispOrOptions;
     if (extraOptions) {
@@ -271,6 +304,9 @@ export function calibrateDepthWithStereoSBS(
       if (extraOptions.expandRadius !== undefined) expandRadius = extraOptions.expandRadius;
       if (extraOptions.alphaConfidence !== undefined) alphaConfidence = extraOptions.alphaConfidence;
       if (extraOptions.contrastStretch !== undefined) contrastStretch = extraOptions.contrastStretch;
+      if (extraOptions.rightDaDepth !== undefined) rightDaDepth = extraOptions.rightDaDepth;
+      if (extraOptions.conf0 !== undefined) conf0 = extraOptions.conf0;
+      if (extraOptions.conf1 !== undefined) conf1 = extraOptions.conf1;
     }
   }
   void alphaConfidence;
@@ -536,10 +572,37 @@ export function calibrateDepthWithStereoSBS(
 
   // --------------------------------------------------------------------------
   // STEP C: Calibrated Depth Mapping & Percentile Contrast Stretching
+  // Multi-view stereo consensus fusion if right eye depth is present
   // --------------------------------------------------------------------------
   const calibratedFloat = new Float32Array(eyeWidth * eyeHeight);
-  for (let i = 0; i < calibratedFloat.length; i++) {
-    calibratedFloat[i] = scaleA * leftDaDepth[i] + shiftB;
+  for (let y = 0; y < eyeHeight; y++) {
+    const rowOffset = y * eyeWidth;
+    for (let x = 0; x < eyeWidth; x++) {
+      const idx = rowOffset + x;
+      const d0 = leftDaDepth[idx];
+
+      if (rightDaDepth) {
+        // Physical stereo disparity from calibrated left depth
+        const d0CalNorm = Math.max(0, Math.min(1, scaleA * d0 + shiftB));
+        const disp = dispMin + d0CalNorm * dispSpan;
+        const xr = Math.max(0, Math.min(eyeWidth - 1, Math.round(x - disp)));
+        const d1 = rightDaDepth[rowOffset + xr];
+
+        const c0 = conf0 ? Math.max(1e-4, conf0[idx]) : 1.0;
+        const c1 = conf1 ? Math.max(1e-4, conf1[rowOffset + xr]) : 1.0;
+
+        // Where both views agree in 3D space, weight by confidence.
+        // In half-occluded areas, exp(-diff * 6.0) falls to 0, smoothly preserving View 0.
+        const diff = Math.abs(d0 - d1);
+        const w0 = c0;
+        const w1 = c1 * Math.exp(-diff * 6.0);
+        const dConsensus = (w0 * d0 + w1 * d1) / (w0 + w1);
+
+        calibratedFloat[idx] = scaleA * dConsensus + shiftB;
+      } else {
+        calibratedFloat[idx] = scaleA * d0 + shiftB;
+      }
+    }
   }
 
   // Compute robust percentiles (p2 and p98) to stretch depth map to full [0, 255] dynamic range
@@ -884,6 +947,9 @@ export class DepthAnythingController {
           gradThreshold: this.options.gradThreshold ?? 12,
           step: this.options.step ?? 2,
           contrastStretch: this.options.contrastStretch ?? true,
+          rightDaDepth: result.rawRightDepth,
+          conf0: result.conf0 ?? result.confidence,
+          conf1: result.conf1,
         }
       );
 
@@ -907,6 +973,7 @@ export class DepthAnythingController {
         frameId: result.frameId || this.frameCounter,
         anchorCount: calResult.anchorCount,
         modelVersion: this.modelVersion,
+        numViews: result.numViews ?? (this.modelVersion === 'v3' ? 2 : 1),
       };
 
       this.lastTelemetry = telemetry;
@@ -1006,16 +1073,18 @@ export class DepthAnythingController {
     this.pendingMaxDisp = effectiveMaxDisp;
 
     const leftEyeRgba = extractLeftEyeRgba(sbsRgba, sbsWidth, sbsHeight);
+    const rightEyeRgba = this.modelVersion === 'v3' ? extractRightEyeRgba(sbsRgba, sbsWidth, sbsHeight) : undefined;
     const inputSize = this.options.inputSize || 504;
 
     if (this.options.customInfer) {
       this.options
-        .customInfer(leftEyeRgba, eyeWidth, eyeHeight, inputSize)
+        .customInfer(leftEyeRgba, eyeWidth, eyeHeight, inputSize, rightEyeRgba)
         .then((res) => {
           this.handleDepthResult({
             type: 'depthReady',
             frameId: this.frameCounter,
             rawDepth: res.rawDepth,
+            numViews: rightEyeRgba ? 2 : 1,
             width: eyeWidth,
             height: eyeHeight,
             backend: res.backend,
@@ -1035,12 +1104,17 @@ export class DepthAnythingController {
         type: 'infer',
         frameId: this.frameCounter,
         rgbaData: leftEyeRgba,
+        rightRgbaData: rightEyeRgba,
         width: eyeWidth,
         height: eyeHeight,
         size: inputSize,
       };
-      // Transfer leftEyeRgba buffer to avoid memory copies
-      this.worker.postMessage(msg, [leftEyeRgba.buffer]);
+      // Transfer buffers to avoid memory copies
+      const transferables: Transferable[] = [leftEyeRgba.buffer];
+      if (rightEyeRgba) {
+        transferables.push(rightEyeRgba.buffer);
+      }
+      this.worker.postMessage(msg, transferables);
       return true;
     }
 
