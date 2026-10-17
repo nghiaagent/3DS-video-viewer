@@ -97,6 +97,7 @@ describe('GLSL Shader Sources & Perspective Warp UV Bounds', () => {
     expect(TIEFLING_MESH_VERTEX_SHADER_SOURCE).toContain('uniform float u_verticalTilt;');
     expect(TIEFLING_MESH_VERTEX_SHADER_SOURCE).toContain('uniform float u_meshDepth;');
     expect(TIEFLING_MESH_VERTEX_SHADER_SOURCE).toContain('uniform float u_focus;');
+    expect(TIEFLING_MESH_VERTEX_SHADER_SOURCE).toContain('uniform vec2 u_dispTexelSize;');
     expect(TIEFLING_MESH_VERTEX_SHADER_SOURCE).toContain('uniform float u_sensitivity;');
     expect(TIEFLING_MESH_VERTEX_SHADER_SOURCE).toContain('uniform float u_windowCrop;');
     expect(TIEFLING_MESH_VERTEX_SHADER_SOURCE).toContain('uniform float u_flipY;');
@@ -110,8 +111,8 @@ describe('GLSL Shader Sources & Perspective Warp UV Bounds', () => {
     expect(TIEFLING_DEPTH_FILTER_FRAG_SOURCE).toContain('#version 300 es');
     expect(TIEFLING_DEPTH_FILTER_FRAG_SOURCE).toContain('uniform sampler2D u_rawDispTexture;');
     expect(TIEFLING_DEPTH_FILTER_FRAG_SOURCE).toContain('uniform vec2 u_dispTexelSize;');
-    expect(TIEFLING_DEPTH_FILTER_FRAG_SOURCE).toContain('gradientMag > 0.08');
-    expect(TIEFLING_DEPTH_FILTER_FRAG_SOURCE).toContain('smoothedDilated');
+    expect(TIEFLING_DEPTH_FILTER_FRAG_SOURCE).toContain('wForeground');
+    expect(TIEFLING_DEPTH_FILTER_FRAG_SOURCE).toContain('sumFilteredD');
   });
 
   it('verifies Tiefling perspective unprojection yields exact undistorted basePos when mouseDelta == (0, 0)', () => {

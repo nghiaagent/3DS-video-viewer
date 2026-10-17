@@ -33,29 +33,12 @@ void main() {
     float dCenter = texture(u_rawDispTexture, v_uv).r;
     vec3 centerColor = texture(u_sbsTexture, vec2(v_uv.x * 0.5, v_uv.y)).rgb;
 
-    // Radius 2 (5x5) Foreground max-dilation
-    float maxDilated = dCenter;
-    for (int dy = -2; dy <= 2; dy++) {
-        for (int dx = -2; dx <= 2; dx++) {
-            if (dx * dx + dy * dy <= 5) {
-                float sampleD = texture(u_rawDispTexture, v_uv + vec2(float(dx), float(dy)) * u_dispTexelSize).r;
-                maxDilated = max(maxDilated, sampleD);
-            }
-        }
-    }
-
-    // Wide 9x9 ([-4..4]) Joint Bilateral Filter with Gaussian spatial + color similarity
-    // sigma_spatial = 2.0 -> 2 * sigma_spatial^2 = 8.0
-    // sigma_color = 0.18 -> 2 * sigma_color^2 = 0.0648
-    const float twoSigmaSpatialSq = 8.0;
-    const float twoSigmaColorSq = 0.0648;
-
     float sumWeights = 0.0;
     float sumFilteredD = 0.0;
 
     for (int dy = -4; dy <= 4; dy++) {
         for (int dx = -4; dx <= 4; dx++) {
-            vec2 offsetUV = clamp(v_uv + vec2(float(dx), float(dy)) * u_dispTexelSize, 0.001, 0.999);
+            vec2 offsetUV = clamp(v_uv + vec2(float(dx), float(dy)) * u_dispTexelSize, 0.002, 0.998);
             float sampleD = texture(u_rawDispTexture, offsetUV).r;
             vec3 sampleColor = texture(u_sbsTexture, vec2(offsetUV.x * 0.5, offsetUV.y)).rgb;
 
@@ -63,29 +46,20 @@ void main() {
             vec3 colorDiff = sampleColor - centerColor;
             float colorDistSq = dot(colorDiff, colorDiff);
 
-            float weight = exp(-spatialDistSq / twoSigmaSpatialSq) * exp(-colorDistSq / twoSigmaColorSq);
+            // Smooth isotropic Gaussian spatial weight (sigma = 2.5 -> 2*sigma^2 = 12.5)
+            // + gentle color guidance (sigma_c = 0.25 -> 2*sigma_c^2 = 0.125)
+            // + smooth Tiefling foreground dilation bias: exp((sampleD - dCenter) * 1.8) softly favors foreground without any diamond steps!
+            float wSpatial = exp(-spatialDistSq / 12.5);
+            float wColor = exp(-colorDistSq / 0.125);
+            float wForeground = exp((sampleD - dCenter) * 1.8);
+            float weight = wSpatial * mix(1.0, wColor, 0.5) * wForeground;
 
             sumFilteredD += sampleD * weight;
             sumWeights += weight;
         }
     }
 
-    float bilateralD = sumFilteredD / max(1e-4, sumWeights);
-
-    // Gradient magnitude detection for silhouette preservation
-    float dL  = texture(u_rawDispTexture, v_uv - vec2(u_dispTexelSize.x, 0.0)).r;
-    float dR  = texture(u_rawDispTexture, v_uv + vec2(u_dispTexelSize.x, 0.0)).r;
-    float dU  = texture(u_rawDispTexture, v_uv + vec2(0.0, u_dispTexelSize.y)).r;
-    float dD  = texture(u_rawDispTexture, v_uv - vec2(0.0, u_dispTexelSize.y)).r;
-    float gradientMag = abs(dR - dL) + abs(dU - dD);
-
-    float smoothedDilated = mix(maxDilated, bilateralD, 0.35);
-
-    float outDepth = bilateralD;
-    if (gradientMag > 0.08) {
-        outDepth = smoothedDilated;
-    }
-
+    float outDepth = sumFilteredD / max(1e-4, sumWeights);
     outColor = vec4(outDepth, 0.0, 0.0, 1.0);
 }
 `;
@@ -98,6 +72,7 @@ in vec2 a_uv;
 out vec2 v_uv;
 
 uniform sampler2D u_dispTexture;
+uniform vec2 u_dispTexelSize;
 uniform float u_viewShift;
 uniform float u_verticalTilt;
 uniform float u_meshDepth;
@@ -121,7 +96,12 @@ void main() {
 
     // Tiefling 3D Parallax Mesh mode
     vec2 sampleUV = clamp(vec2(u_windowCrop + uv.x * (1.0 - 2.0 * u_windowCrop), uv.y), 0.0, 1.0);
-    float depth = texture(u_dispTexture, sampleUV).r;
+    float dC = texture(u_dispTexture, sampleUV).r;
+    float dL = texture(u_dispTexture, clamp(sampleUV - vec2(u_dispTexelSize.x, 0.0), 0.0, 1.0)).r;
+    float dR = texture(u_dispTexture, clamp(sampleUV + vec2(u_dispTexelSize.x, 0.0), 0.0, 1.0)).r;
+    float dU = texture(u_dispTexture, clamp(sampleUV + vec2(0.0, u_dispTexelSize.y), 0.0, 1.0)).r;
+    float dD = texture(u_dispTexture, clamp(sampleUV - vec2(0.0, u_dispTexelSize.y), 0.0, 1.0)).r;
+    float depth = dC * 0.4 + (dL + dR + dU + dD) * 0.15;
     float z = depth * u_meshDepth;
 
     // Tiefling exact perspective compensation (cameraZ = 4.0)
@@ -400,7 +380,12 @@ void main() {
 
     // Mode 1: Disparity Heatmap
     if (u_renderMode == 1) {
-        float dVal = texture(u_dispTexture, eyeUV).r;
+        float dC = texture(u_dispTexture, eyeUV).r;
+        float dL = texture(u_dispTexture, clamp(eyeUV - vec2(u_dispTexelSize.x, 0.0), 0.0, 1.0)).r;
+        float dR = texture(u_dispTexture, clamp(eyeUV + vec2(u_dispTexelSize.x, 0.0), 0.0, 1.0)).r;
+        float dU = texture(u_dispTexture, clamp(eyeUV + vec2(0.0, u_dispTexelSize.y), 0.0, 1.0)).r;
+        float dD = texture(u_dispTexture, clamp(eyeUV - vec2(0.0, u_dispTexelSize.y), 0.0, 1.0)).r;
+        float dVal = dC * 0.4 + (dL + dR + dU + dD) * 0.15;
         vec3 heatmap = turboColormap(dVal);
         outColor = vec4(heatmap, 1.0);
         return;
