@@ -41,4 +41,20 @@ describe('DCIM Catalog & Helper Functions', () => {
     expect(fs.statSync(coreJs).size).toBeGreaterThan(100_000);
     expect(fs.statSync(coreWasm).size).toBeGreaterThan(30_000_000);
   });
+
+  it('correctly resolves subpath URLs for GitHub Pages deployment', () => {
+    const ghPagesBase = 'https://nghiaagent.github.io/3DS-video-viewer/';
+    const ghPagesIndex = 'https://nghiaagent.github.io/3DS-video-viewer/index.html';
+
+    const coreUrlFromBase = new URL('./ffmpeg/ffmpeg-core.js', ghPagesBase).href;
+    const wasmUrlFromBase = new URL('./ffmpeg/ffmpeg-core.wasm', ghPagesBase).href;
+    const manifestFromBase = new URL('./samples/manifest.json', ghPagesBase).href;
+
+    const coreUrlFromIndex = new URL('./ffmpeg/ffmpeg-core.js', ghPagesIndex).href;
+
+    expect(coreUrlFromBase).toBe('https://nghiaagent.github.io/3DS-video-viewer/ffmpeg/ffmpeg-core.js');
+    expect(wasmUrlFromBase).toBe('https://nghiaagent.github.io/3DS-video-viewer/ffmpeg/ffmpeg-core.wasm');
+    expect(manifestFromBase).toBe('https://nghiaagent.github.io/3DS-video-viewer/samples/manifest.json');
+    expect(coreUrlFromIndex).toBe('https://nghiaagent.github.io/3DS-video-viewer/ffmpeg/ffmpeg-core.js');
+  });
 });

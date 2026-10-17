@@ -254,4 +254,39 @@ test.describe('3DS Stereoscopic Parallax Viewer E2E Suite', () => {
     expect(webmVideoStream.height).toBe(480);
     console.log(`Verified WebM with ffprobe: codec=${webmVideoStream.codec_name}, ${webmVideoStream.width}x${webmVideoStream.height}`);
   });
+
+  test('5. Subpath URL Resolution & In-Browser FFmpeg Subpath Loading', async ({ page }) => {
+    await page.goto('/');
+
+    const resolutionResults = await page.evaluate(async () => {
+      // 1. Verify URL resolution math under GitHub Pages subpath
+      const ghPagesBase = 'https://nghiaagent.github.io/3DS-video-viewer/';
+      const ghPagesIndex = 'https://nghiaagent.github.io/3DS-video-viewer/index.html';
+
+      const coreFromBase = new URL('./ffmpeg/ffmpeg-core.js', ghPagesBase).href;
+      const wasmFromBase = new URL('./ffmpeg/ffmpeg-core.wasm', ghPagesBase).href;
+      const coreFromIndex = new URL('./ffmpeg/ffmpeg-core.js', ghPagesIndex).href;
+
+      // 2. Verify current page's FFmpeg core assets are reachable with 200 OK
+      const currentCore = new URL('./ffmpeg/ffmpeg-core.js', window.location.href).href;
+      const currentWasm = new URL('./ffmpeg/ffmpeg-core.wasm', window.location.href).href;
+
+      const resCore = await fetch(currentCore, { method: 'HEAD' });
+      const resWasm = await fetch(currentWasm, { method: 'HEAD' });
+
+      return {
+        coreFromBase,
+        wasmFromBase,
+        coreFromIndex,
+        coreStatus: resCore.status,
+        wasmStatus: resWasm.status,
+      };
+    });
+
+    expect(resolutionResults.coreFromBase).toBe('https://nghiaagent.github.io/3DS-video-viewer/ffmpeg/ffmpeg-core.js');
+    expect(resolutionResults.wasmFromBase).toBe('https://nghiaagent.github.io/3DS-video-viewer/ffmpeg/ffmpeg-core.wasm');
+    expect(resolutionResults.coreFromIndex).toBe('https://nghiaagent.github.io/3DS-video-viewer/ffmpeg/ffmpeg-core.js');
+    expect(resolutionResults.coreStatus).toBe(200);
+    expect(resolutionResults.wasmStatus).toBe(200);
+  });
 });

@@ -1,5 +1,5 @@
 import { FFmpeg } from '@ffmpeg/ffmpeg';
-import { fetchFile, toBlobURL } from '@ffmpeg/util';
+import { fetchFile } from '@ffmpeg/util';
 
 export interface VideoSourceInput {
   url: string;
@@ -20,24 +20,47 @@ export async function getFFmpeg(onProgress?: (progress: number) => void): Promis
   }
 
   ffmpegLoadingPromise = (async () => {
-    const ffmpeg = new FFmpeg();
-    ffmpeg.on('progress', ({ progress }) => {
-      onProgress?.(progress);
-    });
-    ffmpeg.on('log', ({ message }) => {
-      if (message.includes('error') || message.includes('Error')) {
-        console.warn('[FFmpeg]', message);
+    try {
+      const ffmpeg = new FFmpeg();
+      ffmpeg.on('progress', ({ progress }) => {
+        onProgress?.(progress);
+      });
+      ffmpeg.on('log', ({ message }) => {
+        if (message.includes('error') || message.includes('Error')) {
+          console.warn('[FFmpeg]', message);
+        }
+      });
+
+      // Robust URL resolution: base on window.location.href so subpaths (e.g. GitHub Pages /3DS-video-viewer/) work
+      const coreUrl = new URL('./ffmpeg/ffmpeg-core.js', window.location.href).href;
+      const wasmUrl = new URL('./ffmpeg/ffmpeg-core.wasm', window.location.href).href;
+
+      // Safe fetch helper verifying res.ok before creating Blob URL to prevent converting 404 HTML pages into JS blobs
+      async function safeToBlobURL(url: string, mimeType: string): Promise<string> {
+        const res = await fetch(url);
+        if (!res.ok) {
+          throw new Error(`Failed to load ${url}: HTTP ${res.status} ${res.statusText}`);
+        }
+        const blob = await res.blob();
+        return URL.createObjectURL(new Blob([await blob.arrayBuffer()], { type: mimeType }));
       }
-    });
 
-    const baseURL = `${window.location.origin}/ffmpeg`;
-    await ffmpeg.load({
-      coreURL: await toBlobURL(`${baseURL}/ffmpeg-core.js`, 'text/javascript'),
-      wasmURL: await toBlobURL(`${baseURL}/ffmpeg-core.wasm`, 'application/wasm'),
-    });
+      const [coreBlobUrl, wasmBlobUrl] = await Promise.all([
+        safeToBlobURL(coreUrl, 'text/javascript'),
+        safeToBlobURL(wasmUrl, 'application/wasm'),
+      ]);
 
-    ffmpegInstance = ffmpeg;
-    return ffmpeg;
+      await ffmpeg.load({
+        coreURL: coreBlobUrl,
+        wasmURL: wasmBlobUrl,
+      });
+
+      ffmpegInstance = ffmpeg;
+      return ffmpeg;
+    } catch (err) {
+      ffmpegLoadingPromise = null;
+      throw err;
+    }
   })();
 
   return ffmpegLoadingPromise;
@@ -72,7 +95,7 @@ export async function import3DSVideo(
   // 1. FAST PATH: Standard Side-by-Side MP4 or WebM
   if (ext === 'mp4' || ext === 'webm') {
     onProgress?.('Loading video...', 0.3);
-    const objectUrl = source instanceof File ? URL.createObjectURL(source) : source.url;
+    const objectUrl = source instanceof File ? URL.createObjectURL(source) : new URL(source.url, window.location.href).href;
 
     videoElement.src = objectUrl;
     videoElement.loop = true;
@@ -103,7 +126,7 @@ export async function import3DSVideo(
     });
 
     onProgress?.('Fetching AVI file...', 0.2);
-    const fileSource = source instanceof File ? source : source.url;
+    const fileSource = source instanceof File ? source : new URL(source.url, window.location.href).href;
     const fileData = await fetchFile(fileSource);
 
     const inputName = `input_${Date.now()}.avi`;

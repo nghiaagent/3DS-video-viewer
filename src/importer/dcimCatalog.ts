@@ -41,7 +41,8 @@ export async function fetchDcimList(): Promise<DcimItem[]> {
 
 export async function fetchBundledManifest(): Promise<BundledSample[]> {
   try {
-    const res = await fetch('samples/manifest.json');
+    const manifestUrl = new URL('./samples/manifest.json', window.location.href).href;
+    const res = await fetch(manifestUrl);
     if (!res.ok) {
       return [];
     }
