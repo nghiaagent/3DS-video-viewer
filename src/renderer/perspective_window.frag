@@ -11,7 +11,8 @@ uniform float u_viewShift;       // 0.0 (Left) .. 1.0 (Right), default 0.5
 uniform float u_maxDisparityUV;  // e.g. 24.0 / 480.0 = 0.05
 uniform float u_windowCrop;      // default 0.06
 uniform vec2 u_eyeTexelSize;     // default vec2(1.0 / 480.0, 1.0 / 240.0)
-uniform float u_zeroDispNorm;    // default 4.0 / 28.0 (point where d = 0)
+uniform float u_zeroDispNorm;    // default 0.5
+uniform int u_baseDisp;          // global horizontal baseline convergence offset (pixels)
 uniform int u_renderMode;        // 0: Parallax, 1: Heatmap, 2: Left, 3: Right, 4: SBS, 5: Anaglyph
 
 // Google Turbo colormap for perceptually uniform depth heatmap visualization
@@ -33,6 +34,10 @@ vec3 turboColormap(float x) {
     ), 0.0, 1.0);
 }
 
+float getLuma(vec3 rgb) {
+    return dot(rgb, vec3(0.299, 0.587, 0.114));
+}
+
 void main() {
     // Mode 4: Raw Side-by-Side (SBS) pass-through
     if (u_renderMode == 4) {
@@ -52,16 +57,33 @@ void main() {
         return;
     }
 
-    // Apply floating stereo window crop
-    vec2 eyeUV = v_uv * (1.0 - 2.0 * u_windowCrop) + u_windowCrop;
+    // Floating perspective window pan
+    float t = clamp(u_viewShift, 0.0, 1.0);
+    float s = (t - 0.5) * 2.0; // -1.0 (Left) to +1.0 (Right)
+    float activeWidth = 1.0 - (2.0 * u_windowCrop);
+    float windowOffset = (t - 0.5) * (1.2 * u_windowCrop);
+    vec2 eyeUV = vec2(
+        clamp(u_windowCrop + v_uv.x * activeWidth + windowOffset, 0.005, 0.995),
+        clamp(u_windowCrop + v_uv.y * (1.0 - 2.0 * u_windowCrop), 0.005, 0.995)
+    );
 
-    // 5-tap cross blur on disparity texture for smooth warp transitions
+    // 9-tap bilateral/gaussian smoothed depth dNorm to prevent surface tearing
+    vec2 texel = u_eyeTexelSize;
+    float d00 = texture(u_dispTexture, eyeUV + vec2(-texel.x, -texel.y)).r;
+    float d10 = texture(u_dispTexture, eyeUV + vec2(0.0, -texel.y)).r;
+    float d20 = texture(u_dispTexture, eyeUV + vec2(texel.x, -texel.y)).r;
+    float d01 = texture(u_dispTexture, eyeUV + vec2(-texel.x, 0.0)).r;
     float dCenter = texture(u_dispTexture, eyeUV).r;
-    float dL = texture(u_dispTexture, eyeUV - vec2(u_eyeTexelSize.x, 0.0)).r;
-    float dR = texture(u_dispTexture, eyeUV + vec2(u_eyeTexelSize.x, 0.0)).r;
-    float dU = texture(u_dispTexture, eyeUV + vec2(0.0, u_eyeTexelSize.y)).r;
-    float dD = texture(u_dispTexture, eyeUV - vec2(0.0, u_eyeTexelSize.y)).r;
-    float dNorm = (dCenter * 2.0 + dL + dR + dU + dD) / 6.0;
+    float d21 = texture(u_dispTexture, eyeUV + vec2(texel.x, 0.0)).r;
+    float d02 = texture(u_dispTexture, eyeUV + vec2(-texel.x, texel.y)).r;
+    float d12 = texture(u_dispTexture, eyeUV + vec2(0.0, texel.y)).r;
+    float d22 = texture(u_dispTexture, eyeUV + vec2(texel.x, texel.y)).r;
+
+    float dNorm = (
+        (d00 + d20 + d02 + d22) * 1.0 +
+        (d10 + d01 + d21 + d12) * 2.0 +
+        dCenter * 4.0
+    ) / 16.0;
 
     // Mode 1: Disparity Heatmap
     if (u_renderMode == 1) {
@@ -70,40 +92,76 @@ void main() {
         return;
     }
 
-    // Mode 5: Anaglyph 3D (Red / Cyan)
+    // Global stereo convergence baseline UV offset
+    float baseDispUV = float(u_baseDisp) * u_eyeTexelSize.x;
+
+    // Mode 5: Anaglyph 3D (Red / Cyan) with converged baseline
     if (u_renderMode == 5) {
-        vec3 colorL = texture(u_sbsTexture, vec2(eyeUV.x * 0.5, eyeUV.y)).rgb;
-        vec3 colorR = texture(u_sbsTexture, vec2(0.5 + eyeUV.x * 0.5, eyeUV.y)).rgb;
+        float leftX = clamp(eyeUV.x * 0.5, 0.001, 0.499);
+        float rightX = clamp(0.5 + (eyeUV.x - baseDispUV) * 0.5, 0.501, 0.999);
+        vec3 colorL = texture(u_sbsTexture, vec2(leftX, eyeUV.y)).rgb;
+        vec3 colorR = texture(u_sbsTexture, vec2(rightX, eyeUV.y)).rgb;
         outColor = vec4(colorL.r, colorR.g, colorR.b, 1.0);
         return;
     }
 
-    // Mode 0 (Default): 2D Shifting Perspective Parallax Window
-    float t = clamp(u_viewShift, 0.0, 1.0);
-    float dispUV = (dNorm - u_zeroDispNorm) * u_maxDisparityUV;
+    // Mode 0: Apple Vision Pro 2.5D Depth-Deforming Ray-Marched Warp
+    // Relative depth parallax around zero-disparity plane (dNorm = 0.5)
+    float zeroNorm = (u_zeroDispNorm > 0.0) ? u_zeroDispNorm : 0.5;
+    float relDispUV = (dNorm - zeroNorm) * 2.0 * u_maxDisparityUV;
 
-    // Bidirectional shift relative to camera position t
-    float shiftL = t * dispUV;
-    float shiftR = -(1.0 - t) * dispUV;
+    // 4-step parallax occlusion ray-march along relDispUV * s
+    vec2 rayStep = vec2(relDispUV * s * 0.25, 0.0);
+    vec2 marchedUV = eyeUV;
+    float marchedDepth = dNorm;
+    for (int step = 0; step < 4; ++step) {
+        marchedUV += rayStep;
+        float sampleD = texture(u_dispTexture, marchedUV).r;
+        if (sampleD > marchedDepth) {
+            marchedDepth = mix(marchedDepth, sampleD, 0.35);
+        }
+    }
+    float refinedRelDisp = (marchedDepth - zeroNorm) * 2.0 * u_maxDisparityUV;
 
-    vec2 uvLeft = vec2(
-        clamp((eyeUV.x + shiftL) * 0.5, 0.0, 0.4999),
-        clamp(eyeUV.y, 0.0, 1.0)
-    );
+    // Sample Left eye and converged Right eye
+    float leftX = clamp((eyeUV.x + s * refinedRelDisp * 0.85) * 0.5, 0.001, 0.499);
+    float rightInner = eyeUV.x - baseDispUV + s * refinedRelDisp * 0.85 - refinedRelDisp * 0.5;
+    float rightX = clamp(0.5 + rightInner * 0.5, 0.501, 0.999);
 
-    vec2 uvRight = vec2(
-        clamp(0.5 + (eyeUV.x + shiftR) * 0.5, 0.5, 0.9999),
-        clamp(eyeUV.y, 0.0, 1.0)
-    );
+    vec3 colorL = texture(u_sbsTexture, vec2(leftX, eyeUV.y)).rgb;
+    vec3 colorR = texture(u_sbsTexture, vec2(rightX, eyeUV.y)).rgb;
 
-    vec3 colorL = texture(u_sbsTexture, uvLeft).rgb;
-    vec3 blended = mix(colorL, colorR, t);
+    // Photometric agreement and exposure compensation
+    float photoDiff = length(colorL - colorR);
+    float confidence = 1.0 - smoothstep(0.06, 0.22, photoDiff);
 
-    // Apple Vision style subtle edge feathering into dark glass frame
+    float lumaL = getLuma(colorL);
+    float lumaR = getLuma(colorR);
+    vec3 balancedR = colorR * (lumaL / max(lumaR, 0.05));
+
+    // Depth-warped primary eye with confidence-guided secondary fill to eliminate crossfade ghosting
+    float blendWeight = smoothstep(0.15, 0.85, t);
+    vec3 primaryColor = (t < 0.5) ? colorL : balancedR;
+    vec3 secondaryColor = (t < 0.5) ? balancedR : colorL;
+    float fillFactor = (1.0 - confidence) * 0.12 + confidence * (t < 0.5 ? blendWeight : (1.0 - blendWeight));
+    vec3 blended = mix(primaryColor, secondaryColor, fillFactor);
+
+    // Apple Vision Spatial Window Glass Border & Portal Depth Glow
     vec2 edgeDist = min(v_uv, 1.0 - v_uv);
-    float edgeFactor = clamp(min(edgeDist.x, edgeDist.y) / 0.02, 0.0, 1.0);
-    edgeFactor = smoothstep(0.0, 1.0, edgeFactor);
-    blended *= (0.88 + 0.12 * edgeFactor);
+    float cornerRadius = 0.035;
+    vec2 cornerD = max(vec2(0.0), vec2(cornerRadius) - edgeDist);
+    float cornerDist = length(cornerD);
+    float portalMask = 1.0 - smoothstep(cornerRadius - 0.006, cornerRadius, cornerDist);
+
+    // Frosted depth-reactive inner rim
+    float rimDist = min(edgeDist.x, edgeDist.y);
+    float innerRim = smoothstep(0.0, 0.03, rimDist) * (1.0 - smoothstep(0.03, 0.055, rimDist));
+    float depthCueGlow = (dNorm - 0.5) * 0.16 * s;
+    vec3 frostedRim = vec3(0.68, 0.80, 0.96) * (innerRim * (0.07 + max(0.0, depthCueGlow)));
+
+    // Ambient border feathering
+    float frameAlpha = smoothstep(0.0, 0.012, rimDist);
+    blended = (blended + frostedRim) * frameAlpha * portalMask;
 
     outColor = vec4(blended, 1.0);
 }

@@ -7,6 +7,7 @@ import {
   DISPARITY_SAD_FRAG_SOURCE,
   PERSPECTIVE_WINDOW_FRAG_SOURCE,
 } from '../../src/renderer/shaders.js';
+import { WebGLParallaxViewer } from '../../src/renderer/webglViewer.js';
 import { initSync, StereoDisparity, downsample_sbs_rgba_half } from '../../src/wasm/pkg/stereo_disparity.js';
 
 describe('MotionController & Perspective Shift Math', () => {
@@ -70,6 +71,8 @@ describe('GLSL Shader Sources & Perspective Warp UV Bounds', () => {
     expect(DISPARITY_SAD_FRAG_SOURCE).toContain('u_sbsTexture');
     expect(DISPARITY_SAD_FRAG_SOURCE).toContain('u_eyeTexelSize');
     expect(DISPARITY_SAD_FRAG_SOURCE).toContain('u_maxDisp');
+    expect(DISPARITY_SAD_FRAG_SOURCE).toContain('u_baseDisp');
+    expect(DISPARITY_SAD_FRAG_SOURCE).toContain('u_temporalWeight');
 
     expect(PERSPECTIVE_WINDOW_FRAG_SOURCE).toContain('#version 300 es');
     expect(PERSPECTIVE_WINDOW_FRAG_SOURCE).toContain('u_sbsTexture');
@@ -77,49 +80,55 @@ describe('GLSL Shader Sources & Perspective Warp UV Bounds', () => {
     expect(PERSPECTIVE_WINDOW_FRAG_SOURCE).toContain('u_viewShift');
     expect(PERSPECTIVE_WINDOW_FRAG_SOURCE).toContain('u_maxDisparityUV');
     expect(PERSPECTIVE_WINDOW_FRAG_SOURCE).toContain('u_windowCrop');
+    expect(PERSPECTIVE_WINDOW_FRAG_SOURCE).toContain('u_baseDisp');
     expect(PERSPECTIVE_WINDOW_FRAG_SOURCE).toContain('u_renderMode');
     expect(VERTEX_SHADER_SOURCE).toContain('u_flipY');
   });
 
-  it('verifies active stereo window crop and disparity warp stay strictly within eye texture halves', () => {
+  it('verifies 2.5D ray-marched perspective warp stays strictly within eye texture halves across all baseline offsets', () => {
     const crop = 0.06;
     const maxDisparityUV = 24.0 / 480.0; // 0.05
-    const zeroDispNorm = 4.0 / 28.0;
+    const eyeTexelX = 1.0 / 480.0;
 
-    // Test a grid of normalized screen UVs in [0, 1]
-    for (let vy = 0.0; vy <= 1.0; vy += 0.1) {
-      for (let vx = 0.0; vx <= 1.0; vx += 0.1) {
-        // 1. Cropped active eye UV
-        const eyeX = vx * (1.0 - 2.0 * crop) + crop;
-        const eyeY = vy * (1.0 - 2.0 * crop) + crop;
+    // Test across typical 3DS stereo baseline shifts
+    const testBaseDisparities = [-72, -60, -40, -16, 0, 8];
 
-        expect(eyeX).toBeGreaterThanOrEqual(crop - 1e-6);
-        expect(eyeX).toBeLessThanOrEqual(1.0 - crop + 1e-6);
-        expect(eyeY).toBeGreaterThanOrEqual(crop - 1e-6);
-        expect(eyeY).toBeLessThanOrEqual(1.0 - crop + 1e-6);
+    for (const baseDisp of testBaseDisparities) {
+      const baseDispUV = baseDisp * eyeTexelX;
 
-        // Test across disparity range [0.0, 1.0] and camera shift t in [0.0, 1.0]
-        for (let dNorm = 0.0; dNorm <= 1.0; dNorm += 0.25) {
-          const dispUV = (dNorm - zeroDispNorm) * maxDisparityUV;
+      for (let vy = 0.0; vy <= 1.0; vy += 0.2) {
+        for (let vx = 0.0; vx <= 1.0; vx += 0.2) {
+          for (let t = 0.0; t <= 1.0; t += 0.2) {
+            const s = (t - 0.5) * 2.0;
+            const activeWidth = 1.0 - 2.0 * crop;
+            const windowOffset = (t - 0.5) * (1.2 * crop);
 
-          for (let t = 0.0; t <= 1.0; t += 0.25) {
-            const shiftL = t * dispUV;
-            const shiftR = -(1.0 - t) * dispUV;
+            const eyeX = Math.max(0.005, Math.min(0.995, crop + vx * activeWidth + windowOffset));
+            const eyeY = Math.max(0.005, Math.min(0.995, crop + vy * (1.0 - 2.0 * crop)));
 
-            const rawUvLeftX = (eyeX + shiftL) * 0.5;
-            const rawUvRightX = 0.5 + (eyeX + shiftR) * 0.5;
+            expect(eyeX).toBeGreaterThanOrEqual(0.005);
+            expect(eyeX).toBeLessThanOrEqual(0.995);
+            expect(eyeY).toBeGreaterThanOrEqual(0.005);
+            expect(eyeY).toBeLessThanOrEqual(0.995);
 
-            // Clamping rules from perspective_window.frag
-            const clampedUvLeftX = Math.max(0.0, Math.min(0.4999, rawUvLeftX));
-            const clampedUvRightX = Math.max(0.5, Math.min(0.9999, rawUvRightX));
+            for (let dNorm = 0.0; dNorm <= 1.0; dNorm += 0.25) {
+              const relDispUV = (dNorm - 0.5) * 2.0 * maxDisparityUV;
 
-            // Left eye must be strictly in [0.0, 0.5]
-            expect(clampedUvLeftX).toBeGreaterThanOrEqual(0.0);
-            expect(clampedUvLeftX).toBeLessThan(0.5);
+              // 2.5D ray-marched warp logic
+              const refinedRelDisp = relDispUV; // worst-case bounds
+              const rawLeftX = (eyeX + s * refinedRelDisp * 0.85) * 0.5;
+              const rightInner = eyeX - baseDispUV + s * refinedRelDisp * 0.85 - refinedRelDisp * 0.5;
+              const rawRightX = 0.5 + rightInner * 0.5;
 
-            // Right eye must be strictly in [0.5, 1.0]
-            expect(clampedUvRightX).toBeGreaterThanOrEqual(0.5);
-            expect(clampedUvRightX).toBeLessThan(1.0);
+              const clampedLeftX = Math.max(0.001, Math.min(0.499, rawLeftX));
+              const clampedRightX = Math.max(0.501, Math.min(0.999, rawRightX));
+
+              expect(clampedLeftX).toBeGreaterThanOrEqual(0.001);
+              expect(clampedLeftX).toBeLessThan(0.5);
+
+              expect(clampedRightX).toBeGreaterThanOrEqual(0.501);
+              expect(clampedRightX).toBeLessThan(1.0);
+            }
           }
         }
       }
@@ -205,5 +214,64 @@ describe('Rust Wasm SIMD Disparity Integration', () => {
     expect(ptr).toBeGreaterThan(0);
     expect(halfEngine.disparity_ptr()).toBe(ptr);
     expect(halfEngine.disparity_len()).toBe(240 * 120);
+
+    // 4. Test Wasm base_disp getter and setter
+    expect(halfEngine.base_disp()).toBe(0);
+    halfEngine.set_base_disp(-72);
+    expect(halfEngine.base_disp()).toBe(-72);
+    halfEngine.set_base_disp(0);
+  });
+
+  it('accurately estimates real 3DS stereo convergence offsets across typical disparity ranges in Wasm & TypeScript', () => {
+    const wasmPath = path.resolve(__dirname, '../../src/wasm/pkg/stereo_disparity_bg.wasm');
+    const wasmBytes = fs.readFileSync(wasmPath);
+    initSync({ module: wasmBytes });
+
+    const eyeW = 480;
+    const eyeH = 240;
+    const sbsW = 960;
+
+    // Test shifts corresponding to real 3DS videos (e.g. -72 for HNI_0062, -16 for HNI_0001, 0 for synthetic, +8)
+    const testShifts = [-72, -48, -16, 0, 8];
+
+    for (const shift of testShifts) {
+      const syntheticRgba = new Uint8Array(sbsW * eyeH * 4);
+
+      for (let y = 0; y < eyeH; y++) {
+        for (let x = 0; x < eyeW; x++) {
+          const lVal = ((x * 374761393) ^ (y * 668265263)) & 0xff;
+          const lIdx = (y * sbsW + x) * 4;
+          syntheticRgba[lIdx] = lVal;
+          syntheticRgba[lIdx + 1] = lVal;
+          syntheticRgba[lIdx + 2] = lVal;
+          syntheticRgba[lIdx + 3] = 255;
+
+          // xR = x - shift
+          const rx = x - shift;
+          if (rx >= 0 && rx < eyeW) {
+            const rIdx = (y * sbsW + eyeW + rx) * 4;
+            syntheticRgba[rIdx] = lVal;
+            syntheticRgba[rIdx + 1] = lVal;
+            syntheticRgba[rIdx + 2] = lVal;
+            syntheticRgba[rIdx + 3] = 255;
+          }
+        }
+      }
+
+      // 1. Test TypeScript baseline estimator
+      const tsDetected = WebGLParallaxViewer.prototype.estimateGlobalBaselineFromRgba(
+        syntheticRgba,
+        sbsW,
+        eyeH
+      );
+      expect(tsDetected).toBe(shift);
+
+      // 2. Test Wasm baseline estimator
+      const wasmEngine = new StereoDisparity(eyeW, eyeH, 24);
+      const wasmDetected = wasmEngine.estimate_global_disparity(syntheticRgba, -112, 32);
+      expect(wasmDetected).toBe(shift);
+      expect(wasmEngine.base_disp()).toBe(shift);
+    }
   });
 });
+

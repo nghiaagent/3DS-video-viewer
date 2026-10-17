@@ -12,6 +12,13 @@ export class StereoDisparity {
         wasm.__wbg_stereodisparity_free(ptr, 0);
     }
     /**
+     * @returns {number}
+     */
+    base_disp() {
+        const ret = wasm.stereodisparity_base_disp(this.__wbg_ptr);
+        return ret;
+    }
+    /**
      * Computes disparity map into internal buffer and returns a cloned Vec<u8>.
      * @param {Uint8Array} sbs_rgba
      * @returns {Uint8Array}
@@ -51,6 +58,21 @@ export class StereoDisparity {
         return ret >>> 0;
     }
     /**
+     * Computes disparity map into internal buffer and returns a cloned Vec<u8>.
+     * Estimates the global horizontal stereo baseline shift between Left and Right eyes.
+     * Returns the optimal horizontal disparity in pixels within [min_shift, max_shift].
+     * @param {Uint8Array} sbs_rgba
+     * @param {number} min_shift
+     * @param {number} max_shift
+     * @returns {number}
+     */
+    estimate_global_disparity(sbs_rgba, min_shift, max_shift) {
+        const ptr0 = passArray8ToWasm0(sbs_rgba, wasm.__wbindgen_malloc);
+        const len0 = WASM_VECTOR_LEN;
+        const ret = wasm.stereodisparity_estimate_global_disparity(this.__wbg_ptr, ptr0, len0, min_shift, max_shift);
+        return ret;
+    }
+    /**
      * @returns {number}
      */
     height() {
@@ -74,6 +96,12 @@ export class StereoDisparity {
         this.__wbg_ptr = ret;
         StereoDisparityFinalization.register(this, this.__wbg_ptr, this);
         return this;
+    }
+    /**
+     * @param {number} base
+     */
+    set_base_disp(base) {
+        wasm.stereodisparity_set_base_disp(this.__wbg_ptr, base);
     }
     /**
      * @returns {number}

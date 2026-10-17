@@ -5,6 +5,7 @@ pub struct StereoDisparity {
     eye_width: usize,
     eye_height: usize,
     max_disp: i32,
+    base_disp: i32,
     left_luma: Vec<u8>,
     right_luma: Vec<u8>,
     disparity_map: Vec<u8>,
@@ -19,6 +20,7 @@ impl StereoDisparity {
             eye_width,
             eye_height,
             max_disp,
+            base_disp: 0,
             left_luma: vec![0u8; pixel_count],
             right_luma: vec![0u8; pixel_count],
             disparity_map: vec![0u8; pixel_count],
@@ -35,6 +37,14 @@ impl StereoDisparity {
 
     pub fn max_disp(&self) -> i32 {
         self.max_disp
+    }
+
+    pub fn base_disp(&self) -> i32 {
+        self.base_disp
+    }
+
+    pub fn set_base_disp(&mut self, base: i32) {
+        self.base_disp = base;
     }
 
     pub fn disparity_ptr(&self) -> *const u8 {
@@ -122,6 +132,95 @@ impl StereoDisparity {
     }
 
     /// Computes disparity map into internal buffer and returns a cloned Vec<u8>.
+    /// Estimates the global horizontal stereo baseline shift between Left and Right eyes.
+    /// Returns the optimal horizontal disparity in pixels within [min_shift, max_shift].
+    pub fn estimate_global_disparity(&mut self, sbs_rgba: &[u8], min_shift: i32, max_shift: i32) -> i32 {
+        self.extract_luma(sbs_rgba);
+        let w = self.eye_width as i32;
+        let h = self.eye_height as i32;
+
+        let y_start = (h / 6).max(2);
+        let y_end = (5 * h / 6).min(h - 2);
+        let x_start = (w / 6).max(4);
+        let x_end = (5 * w / 6).min(w - 4);
+
+        let left_ptr = self.left_luma.as_ptr();
+        let right_ptr = self.right_luma.as_ptr();
+        let w_usize = self.eye_width;
+
+        let mut best_coarse_d = min_shift;
+        let mut min_coarse_sad = u64::MAX;
+
+        // Coarse pass: step 4
+        let mut d = min_shift;
+        while d <= max_shift {
+            let mut sad_sum = 0u64;
+            let mut count = 0u64;
+
+            for y in (y_start..y_end).step_by(4) {
+                let row_offset = (y as usize) * w_usize;
+                for x in (x_start..x_end).step_by(4) {
+                    let rx = x - d;
+                    if rx >= 0 && rx < w {
+                        unsafe {
+                            let l_val = *left_ptr.add(row_offset + x as usize);
+                            let r_val = *right_ptr.add(row_offset + rx as usize);
+                            sad_sum += l_val.abs_diff(r_val) as u64;
+                            count += 1;
+                        }
+                    }
+                }
+            }
+
+            if count > 0 {
+                let mean_sad = (sad_sum * 1024) / count;
+                if mean_sad < min_coarse_sad {
+                    min_coarse_sad = mean_sad;
+                    best_coarse_d = d;
+                }
+            }
+            d += 4;
+        }
+
+        // Fine pass: step 1 around best_coarse_d
+        let mut best_d = best_coarse_d;
+        let mut min_fine_sad = u64::MAX;
+        let fine_min = (best_coarse_d - 3).max(min_shift);
+        let fine_max = (best_coarse_d + 3).min(max_shift);
+
+        for d in fine_min..=fine_max {
+            let mut sad_sum = 0u64;
+            let mut count = 0u64;
+
+            for y in (y_start..y_end).step_by(2) {
+                let row_offset = (y as usize) * w_usize;
+                for x in (x_start..x_end).step_by(2) {
+                    let rx = x - d;
+                    if rx >= 0 && rx < w {
+                        unsafe {
+                            let l_val = *left_ptr.add(row_offset + x as usize);
+                            let r_val = *right_ptr.add(row_offset + rx as usize);
+                            sad_sum += l_val.abs_diff(r_val) as u64;
+                            count += 1;
+                        }
+                    }
+                }
+            }
+
+            if count > 0 {
+                let mean_sad = (sad_sum * 1024) / count;
+                if mean_sad < min_fine_sad {
+                    min_fine_sad = mean_sad;
+                    best_d = d;
+                }
+            }
+        }
+
+        self.base_disp = best_d;
+        best_d
+    }
+
+    /// Computes disparity map into internal buffer and returns a cloned Vec<u8>.
     pub fn compute_disparity(&mut self, sbs_rgba: &[u8]) -> Vec<u8> {
         self.compute_internal(sbs_rgba);
         self.disparity_map.clone()
@@ -140,9 +239,12 @@ impl StereoDisparity {
 
         let w = self.eye_width;
         let h = self.eye_height;
-        let max_d = self.max_disp;
-        let min_d = -4i32;
-        let d_range = (max_d - min_d) as u32;
+        let (min_d, max_d) = if self.base_disp == 0 {
+            (-4i32, self.max_disp)
+        } else {
+            (self.base_disp - self.max_disp, self.base_disp + self.max_disp)
+        };
+        let d_range = (max_d - min_d).max(1) as u32;
 
         const RADIUS: usize = 4;
         const STEPS: [i32; 5] = [-4, -2, 0, 2, 4];
@@ -152,8 +254,8 @@ impl StereoDisparity {
         let y_start = RADIUS;
         let y_end = h.saturating_sub(RADIUS);
 
-        let x_start = (max_d + 4).max(4) as usize;
-        let x_end = w.saturating_sub(8);
+        let x_start = (max_d + 4).max(4).max(0) as usize;
+        let x_end = ((w as i32 - 4 + min_d.min(0)).min(w as i32 - 4)).max(x_start as i32) as usize;
 
         if y_end <= y_start || x_end <= x_start {
             return;
@@ -176,7 +278,7 @@ impl StereoDisparity {
                 right_row_offsets[i] = sy * w;
             }
 
-            let mut prev_best_d = 0i32;
+            let mut prev_best_d = self.base_disp;
 
             for x in x_start..x_end {
                 // Preload the 25 left samples (fixed for this x, y across all d)
@@ -196,7 +298,7 @@ impl StereoDisparity {
                 let start_d = if prev_best_d >= min_d && prev_best_d <= max_d {
                     prev_best_d
                 } else {
-                    0
+                    self.base_disp
                 };
 
                 let mut best_sad = 0u32;
