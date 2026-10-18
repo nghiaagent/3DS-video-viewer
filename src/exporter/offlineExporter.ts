@@ -1,9 +1,21 @@
 import * as Mp4Muxer from 'mp4-muxer';
 import * as WebmMuxer from 'webm-muxer';
 import type { WebGLParallaxViewer } from '../renderer/webglViewer.js';
-import { getPerspectiveShift } from '../renderer/motionController.js';
+import {
+  DEFAULT_ORBIT,
+  getOrbitOffset,
+  getWindowPose,
+  loopedOrbit,
+  offsetToRenderParams,
+  type MotionOffset,
+  type OrbitSettings,
+} from '../renderer/motionPath.js';
+import { StageRenderer } from './stageRenderer.js';
 
 export type ExportFormat = 'mp4' | 'webm';
+
+/** 'stage': the whole framed window on the dark stage (1920x1080). 'content': only the viewer canvas, as before. */
+export type ExportFrame = 'stage' | 'content';
 
 export interface ExportProgress {
   progress: number;
@@ -11,12 +23,34 @@ export interface ExportProgress {
   totalFrames: number;
 }
 
+export interface ExportMotion {
+  /** Orbit radius, speed and shape. Defaults to DEFAULT_ORBIT. */
+  settings?: OrbitSettings;
+  /** Starting angle of the orbit in radians. */
+  phase0?: number;
+  /** Round the orbit speed to a whole number of orbits per clip so the first and last frames match (seamless loop), when that
+   * stays close to the requested speed. Default true. */
+  loop?: boolean;
+  /** Hold one view direction instead of orbiting. */
+  fixed?: MotionOffset;
+}
+
 export interface OfflineExportOptions {
+  /** Output frame rate. Default 60: the camera moves every frame even though the 3DS footage is about 20 fps. */
   fps?: number;
   maxDurationSec?: number;
   bitrate?: number;
   onProgress?: (progress: number, currentFrame: number, totalFrames: number) => void;
   triggerDownload?: boolean;
+  /** Default 'stage'. */
+  frame?: ExportFrame;
+  /**
+   * Camera path. The exported clip always moves (an orbit unless a fixed view is given): a still camera would produce a
+   * flat 2D video, which is not what this export is for.
+   */
+  motion?: ExportMotion;
+  /** Frame rate of the source video; the video is only re-seeked when the source frame changes. Default 20. */
+  sourceFps?: number;
 }
 
 export interface ExportResult {
@@ -27,13 +61,28 @@ export interface ExportResult {
   width: number;
   height: number;
   durationSec: number;
+  fps: number;
 }
 
+/** Stage export geometry: a 1920x1080 stage with the window at 1.4x its reference size (1344 x 672), centred. */
+export const STAGE_WIDTH = 1920;
+export const STAGE_HEIGHT = 1080;
+export const STAGE_SCALE = 1.4;
+
+/** Codecs to try, best first. 1080p60 needs H.264 level 4.2 / VP9 level 4.1; the older strings are the fallbacks. */
+const STAGE_CODECS: Record<ExportFormat, string[]> = {
+  mp4: ['avc1.64002a', 'avc1.4d002a', 'avc1.42002a'],
+  webm: ['vp09.00.41.08', 'vp09.00.40.08', 'vp09.00.31.08'],
+};
+/** The canvas-only export is 960x480 at 60 fps, which fits the original levels. */
+const CONTENT_CODECS: Record<ExportFormat, string[]> = {
+  mp4: ['avc1.42001f'],
+  webm: ['vp09.00.10.08'],
+};
+
 /**
- * Hardware-accelerated offline WebCodecs video export.
- * Hardcoded strictly to:
- * 1. .mp4 (H.264 / 'avc1.42001f') with mp4-muxer
- * 2. .webm (VP9 / 'vp09.00.10.08') with webm-muxer
+ * Hardware-accelerated offline WebCodecs video export (.mp4 H.264 via mp4-muxer, .webm VP9 via webm-muxer).
+ * By default every frame is the whole stage: glow, shadow, rim and the tilted window around the live 3D picture.
  */
 export async function exportOfflineGPUVideo(
   format: ExportFormat,
@@ -45,76 +94,57 @@ export async function exportOfflineGPUVideo(
     throw new Error('WebCodecs VideoEncoder is not supported in this browser. Please use Real-Time export.');
   }
 
-  const canvas = viewer.getCanvas();
-  const width = canvas.width;
-  const height = canvas.height;
+  const frameMode: ExportFrame = options?.frame ?? 'stage';
   const fps = options?.fps ?? 60;
-  const bitrate = options?.bitrate ?? 6_000_000;
+  const sourceFps = options?.sourceFps ?? 20;
+  const bitrate = options?.bitrate ?? (frameMode === 'stage' ? 14_000_000 : 6_000_000);
 
   // Determine export duration (default to video duration or max 30s)
   const durationSec = Math.min(
-    sourceVideo.duration && isFinite(sourceVideo.duration) && sourceVideo.duration > 0
-      ? sourceVideo.duration
-      : 5.0,
+    sourceVideo.duration && isFinite(sourceVideo.duration) && sourceVideo.duration > 0 ? sourceVideo.duration : 5.0,
     options?.maxDurationSec ?? 30.0
   );
   const totalFrames = Math.max(1, Math.floor(durationSec * fps));
 
+  // Camera path
+  const motion = options?.motion;
+  const baseOrbit = motion?.settings ?? DEFAULT_ORBIT;
+  const orbit: OrbitSettings = motion?.loop === false ? baseOrbit : loopedOrbit(baseOrbit, durationSec);
+  const viewDirectionAt = (tSec: number): MotionOffset => motion?.fixed ?? getOrbitOffset(tSec, orbit, motion?.phase0 ?? 0);
+
+  // For the stage the window is 1344 px wide, so render the picture at the viewer's highest upscale (1440 px) and let the
+  // stage renderer downsample, instead of stretching the usual 960 px canvas.
+  const previousUpscale = viewer.getUpscaleMultiplier();
+  if (frameMode === 'stage') viewer.setUpscaleMultiplier(3);
+  const canvas = viewer.getCanvas();
+  const stage = frameMode === 'stage' ? new StageRenderer(STAGE_WIDTH, STAGE_HEIGHT, STAGE_SCALE) : null;
+  const width = stage ? STAGE_WIDTH : canvas.width;
+  const height = stage ? STAGE_HEIGHT : canvas.height;
+
+  const codecString = await pickCodec(frameMode === 'stage' ? STAGE_CODECS[format] : CONTENT_CODECS[format], width, height, bitrate, fps);
+  const hardwareAccel = await pickHardwareAcceleration(codecString, width, height, bitrate, fps);
+
   let muxer: Mp4Muxer.Muxer<Mp4Muxer.ArrayBufferTarget> | WebmMuxer.Muxer<WebmMuxer.ArrayBufferTarget>;
-  let codecString: string;
   let filename: string;
   let mimeType: string;
-
   if (format === 'mp4') {
-    codecString = 'avc1.42001f'; // H.264 Baseline Level 3.1
-    filename = `3ds_parallax_2d_${Date.now()}.mp4`;
+    filename = `3ds_parallax_${frameMode === 'stage' ? 'stage' : '2d'}_${Date.now()}.mp4`;
     mimeType = 'video/mp4';
-
     muxer = new Mp4Muxer.Muxer({
       target: new Mp4Muxer.ArrayBufferTarget(),
-      video: {
-        codec: 'avc',
-        width,
-        height,
-      },
+      video: { codec: 'avc', width, height },
       fastStart: 'in-memory',
     });
   } else {
-    codecString = 'vp09.00.10.08'; // VP9 Profile 0 Level 1.0
-    filename = `3ds_parallax_2d_${Date.now()}.webm`;
+    filename = `3ds_parallax_${frameMode === 'stage' ? 'stage' : '2d'}_${Date.now()}.webm`;
     mimeType = 'video/webm';
-
     muxer = new WebmMuxer.Muxer({
       target: new WebmMuxer.ArrayBufferTarget(),
-      video: {
-        codec: 'V_VP9',
-        width,
-        height,
-        frameRate: fps,
-      },
+      video: { codec: 'V_VP9', width, height, frameRate: fps },
     });
-  }
-
-  // Probe hardware acceleration support with fallback
-  let hardwareAccel: HardwareAcceleration = 'prefer-hardware';
-  try {
-    const configCheck = await VideoEncoder.isConfigSupported({
-      codec: codecString,
-      width,
-      height,
-      bitrate,
-      framerate: fps,
-      hardwareAcceleration: 'prefer-hardware',
-    });
-    if (!configCheck.supported) {
-      hardwareAccel = 'no-preference';
-    }
-  } catch {
-    hardwareAccel = 'no-preference';
   }
 
   let encodeError: Error | null = null;
-
   const encoder = new VideoEncoder({
     output: (chunk, meta) => {
       if (format === 'mp4') {
@@ -128,15 +158,7 @@ export async function exportOfflineGPUVideo(
       encodeError = e;
     },
   });
-
-  encoder.configure({
-    codec: codecString,
-    width,
-    height,
-    bitrate,
-    framerate: fps,
-    hardwareAcceleration: hardwareAccel,
-  });
+  encoder.configure({ codec: codecString, width, height, bitrate, framerate: fps, hardwareAcceleration: hardwareAccel });
 
   // Preserve original playback position and pause during offline export
   const originalTime = sourceVideo.currentTime;
@@ -145,24 +167,30 @@ export async function exportOfflineGPUVideo(
 
   const dtSec = 1.0 / fps;
   const dtMicros = Math.round(dtSec * 1_000_000);
+  const lastSourceFrame = Math.max(0, Math.floor((sourceVideo.duration || 1) * sourceFps) - 1);
+  let currentSourceFrame = -1;
 
   try {
     for (let frameIdx = 0; frameIdx < totalFrames; frameIdx++) {
       if (encodeError) throw encodeError;
 
       const tSec = frameIdx * dtSec;
-      sourceVideo.currentTime = Math.min(tSec, (sourceVideo.duration || 1.0) - 0.001);
 
-      await waitForSeek(sourceVideo);
+      // Seek only when the source frame changes (the footage is ~20 fps, the export 60)
+      const sourceFrame = Math.min(lastSourceFrame, Math.round(tSec * sourceFps));
+      if (sourceFrame !== currentSourceFrame) {
+        sourceVideo.currentTime = Math.min(sourceFrame / sourceFps, (sourceVideo.duration || 1.0) - 0.001);
+        await waitForSeek(sourceVideo);
+        currentSourceFrame = sourceFrame;
+      }
 
-      // Camera shift calculation: 0.28Hz auto-oscillation at this exact timestamp
-      const shift = getPerspectiveShift(tSec * 1000.0);
+      // Camera for this exact timestamp, from the same motion path the live viewer uses
+      const direction = viewDirectionAt(tSec);
+      const { viewShift, verticalTilt } = offsetToRenderParams(direction);
+      await viewer.renderVideoFrame(sourceVideo, viewShift, verticalTilt);
 
-      // Render perspective parallax frame directly on GPU
-      await viewer.renderVideoFrame(sourceVideo, shift);
-
-      // Zero-copy capture from WebGL2 canvas backbuffer
-      const videoFrame = new VideoFrame(canvas, {
+      const source: HTMLCanvasElement = stage ? stage.render(canvas, getWindowPose(direction)) : canvas;
+      const videoFrame = new VideoFrame(source, {
         timestamp: Math.round(tSec * 1_000_000),
         duration: dtMicros,
       });
@@ -185,21 +213,39 @@ export async function exportOfflineGPUVideo(
       downloadBlob(blob, filename);
     }
 
-    return {
-      blob,
-      filename,
-      mimeType,
-      codec: codecString,
-      width,
-      height,
-      durationSec,
-    };
+    return { blob, filename, mimeType, codec: codecString, width, height, durationSec, fps };
   } finally {
+    stage?.destroy();
+    if (frameMode === 'stage') viewer.setUpscaleMultiplier(previousUpscale);
     // Restore video state
     sourceVideo.currentTime = originalTime;
     if (!originalPaused) {
       sourceVideo.play().catch(() => {});
     }
+  }
+}
+
+/** First codec string the encoder accepts for this size and rate. */
+async function pickCodec(candidates: string[], width: number, height: number, bitrate: number, fps: number): Promise<string> {
+  for (const codec of candidates) {
+    for (const hardwareAcceleration of ['prefer-hardware', 'no-preference'] as HardwareAcceleration[]) {
+      try {
+        const check = await VideoEncoder.isConfigSupported({ codec, width, height, bitrate, framerate: fps, hardwareAcceleration });
+        if (check.supported) return codec;
+      } catch {
+        // try the next one
+      }
+    }
+  }
+  throw new Error(`No supported video codec for ${width}x${height} at ${fps} fps (tried ${candidates.join(', ')})`);
+}
+
+async function pickHardwareAcceleration(codec: string, width: number, height: number, bitrate: number, fps: number): Promise<HardwareAcceleration> {
+  try {
+    const check = await VideoEncoder.isConfigSupported({ codec, width, height, bitrate, framerate: fps, hardwareAcceleration: 'prefer-hardware' });
+    return check.supported ? 'prefer-hardware' : 'no-preference';
+  } catch {
+    return 'no-preference';
   }
 }
 

@@ -4,6 +4,7 @@ import {
   getOrbitOffset,
   getOrbitOffsetFromPhase,
   getWindowPose,
+  loopedOrbit,
   offsetToRenderParams,
   viewShiftToX,
 } from '../../src/renderer/motionPath.js';
@@ -114,5 +115,29 @@ describe('getWindowPose', () => {
     const p = getWindowPose({ x: 9, y: -9 });
     expect(p.x).toBe(1);
     expect(p.y).toBe(-1);
+  });
+});
+
+describe('loopedOrbit', () => {
+  const base = { freqHz: 0.18, amp: 0.7, yRatio: 0.55 };
+
+  it('rounds the speed to a whole number of orbits so the clip loops, when that stays close to the requested speed', () => {
+    const looped = loopedOrbit(base, 30); // 0.18 Hz * 30 s = 5.4 orbits -> 5
+    expect(looped.freqHz * 30).toBeCloseTo(5, 9);
+    const start = getOrbitOffset(0, looped);
+    const end = getOrbitOffset(30, looped);
+    expect(end.x).toBeCloseTo(start.x, 9);
+    expect(end.y).toBeCloseTo(start.y, 9);
+  });
+
+  it('keeps the requested speed for a short clip instead of forcing a much faster orbit', () => {
+    expect(loopedOrbit(base, 2).freqHz).toBe(0.18); // would need 0.5 Hz
+    expect(loopedOrbit(base, 4).freqHz).toBe(0.18); // 0.72 -> 1 orbit in 4 s = 0.25 Hz, +39%
+  });
+
+  it('only changes the speed, never the shape', () => {
+    const looped = loopedOrbit(base, 30);
+    expect(looped.amp).toBe(base.amp);
+    expect(looped.yRatio).toBe(base.yRatio);
   });
 });

@@ -2,7 +2,14 @@ import './style.css';
 import { WebGLParallaxViewer, type RenderMode, type DisparityBackend, type UpscaleMultiplier } from './renderer/webglViewer.js';
 import { MotionController } from './renderer/motionController.js';
 import { import3DSVideo, type VideoSource } from './importer/import3DSVideo.js';
-import { exportParallaxVideo, exportOfflineGPUVideo, type ExportFormat, type ExportMode } from './exporter/index.js';
+import {
+  exportParallaxVideo,
+  exportOfflineGPUVideo,
+  type ExportFormat,
+  type ExportFrame,
+  type ExportMode,
+} from './exporter/index.js';
+import { StageRenderer } from './exporter/stageRenderer.js';
 import { DepthAnythingController, VideoDepthTimeline } from './depth/stereoGuidedDepth.js';
 import {
   DEFAULT_ORBIT,
@@ -12,6 +19,7 @@ import {
   viewShiftToX,
   type MotionMode,
   type MotionOffset,
+  type OrbitSettings,
 } from './renderer/motionPath.js';
 import {
   dcimPathFromUrl,
@@ -47,6 +55,7 @@ const progressPercent = document.getElementById('progress-percent') as HTMLEleme
 const exportMp4Btn = document.getElementById('export-mp4-btn') as HTMLButtonElement;
 const exportWebmBtn = document.getElementById('export-webm-btn') as HTMLButtonElement;
 const exportModeSelect = document.getElementById('export-mode-select') as HTMLSelectElement | null;
+const exportFrameSelect = document.getElementById('export-frame-select') as HTMLSelectElement | null;
 
 const backendSelect = document.getElementById('backend-select') as HTMLSelectElement | null;
 const renderModeSelect = document.getElementById('render-mode-select') as HTMLSelectElement;
@@ -431,29 +440,33 @@ function setExportProgress(btn: HTMLButtonElement, progress: number) {
 }
 
 // Hardware GPU Video Export Wiring (Circular Progress Rings, Zero Text Clutter)
+// A real-time recording is in progress (the export buttons act as "stop" while it runs)
+let realtimeActive = false;
+
+/** Orbit used for the exported camera: the current Orbit settings when in Orbit mode, otherwise the defaults. */
+function exportOrbitSettings(): OrbitSettings {
+  if (motionMode === 'orbit') {
+    return {
+      freqHz: freqSlider ? parseFloat(freqSlider.value) : DEFAULT_ORBIT.freqHz,
+      amp: ampSlider ? parseFloat(ampSlider.value) : DEFAULT_ORBIT.amp,
+      yRatio: DEFAULT_ORBIT.yRatio,
+    };
+  }
+  return DEFAULT_ORBIT;
+}
+
 async function triggerExport(format: ExportFormat) {
-  if (isExporting) return;
-  isExporting = true;
-  exportMp4Btn.disabled = true;
-  exportWebmBtn.disabled = true;
+  if (isExporting || realtimeActive) return;
 
   const activeBtn = format === 'mp4' ? exportMp4Btn : exportWebmBtn;
-  activeBtn.classList.add('is-exporting');
-  setExportProgress(activeBtn, 0);
-
   const mode: ExportMode = (exportModeSelect?.value as ExportMode) || 'offline';
 
-  try {
-    if (mode === 'offline') {
-      await exportParallaxVideo(format, 'offline', viewer, sourceVideo, {
-        fps: 60,
-        maxDurationSec: 30,
-        triggerDownload: true,
-        onProgress: (p) => {
-          setExportProgress(activeBtn, p);
-        },
-      });
-    } else {
+  if (mode === 'realtime') {
+    // Records the live canvas (content only). The live render loop must keep running, so isExporting stays false.
+    realtimeActive = true;
+    activeBtn.classList.add('is-exporting');
+    setExportProgress(activeBtn, 1);
+    try {
       const session = (await exportParallaxVideo(format, 'realtime', viewer, sourceVideo, {
         triggerDownload: true,
       })) as any;
@@ -462,21 +475,42 @@ async function triggerExport(format: ExportFormat) {
         await session.stop();
         cleanup();
       };
-
       const cleanup = () => {
-        isExporting = false;
-        exportMp4Btn.disabled = false;
-        exportWebmBtn.disabled = false;
+        realtimeActive = false;
         activeBtn.classList.remove('is-exporting');
         setExportProgress(activeBtn, 0);
         exportMp4Btn.removeEventListener('click', onStopClick);
         exportWebmBtn.removeEventListener('click', onStopClick);
       };
-
       exportMp4Btn.addEventListener('click', onStopClick, { once: true });
       exportWebmBtn.addEventListener('click', onStopClick, { once: true });
-      return;
+    } catch (err: unknown) {
+      console.error('[Export Failed]', err);
+      realtimeActive = false;
+      activeBtn.classList.remove('is-exporting');
+      setExportProgress(activeBtn, 0);
     }
+    return;
+  }
+
+  // Offline export renders every frame itself, so the live loop is paused for its duration
+  isExporting = true;
+  exportMp4Btn.disabled = true;
+  exportWebmBtn.disabled = true;
+  activeBtn.classList.add('is-exporting');
+  setExportProgress(activeBtn, 0);
+
+  try {
+    await exportParallaxVideo(format, 'offline', viewer, sourceVideo, {
+      fps: 60,
+      maxDurationSec: 30,
+      triggerDownload: true,
+      frame: (exportFrameSelect?.value as ExportFrame) || 'stage',
+      motion: { settings: exportOrbitSettings() },
+      onProgress: (p) => {
+        setExportProgress(activeBtn, p);
+      },
+    });
   } catch (err: unknown) {
     console.error('[Export Failed]', err);
   } finally {
@@ -498,8 +532,12 @@ let orbitPhase = 0;
 let orbitAmpCurrent = 0;
 const ORBIT_AMP_EASE_SEC = 0.4;
 
+// Test/debug hook: pin the view direction (null = normal behaviour)
+let motionOverride: MotionOffset | null = null;
+
 /** Current view direction for the selected motion mode: x, y in [-1, 1]. */
 function resolveMotion(timestampMs: number, dtSeconds: number): MotionOffset {
+  if (motionOverride) return motionOverride;
   if (motionMode === 'manual') {
     return {
       x: viewShiftToX(manualShiftSlider ? parseFloat(manualShiftSlider.value) : 0.5),
@@ -609,6 +647,17 @@ requestAnimationFrame(renderLoop);
   },
   get inferenceTimeMs() {
     return depthController.inferenceTimeMs;
+  },
+  setMotionOverride: (offset: MotionOffset | null) => {
+    motionOverride = offset;
+  },
+  /** Renders the export stage for the pinned view direction at the given size; returns a PNG data URL. */
+  renderStageSnapshot: (width: number, height: number, scale: number): string => {
+    const stage = new StageRenderer(width, height, scale);
+    const canvasOut = stage.render(canvas, getWindowPose(motionOverride ?? { x: 0, y: 0 }));
+    const url = canvasOut.toDataURL('image/png');
+    stage.destroy();
+    return url;
   },
   hasExternalDepthMap: () => viewer.hasExternalDepthMap(),
   setDepthModel: (v: 'v3') => depthController.setModelVersion(v),

@@ -575,6 +575,10 @@ export class WebGLParallaxViewer {
     }
   }
 
+  public getUpscaleMultiplier(): UpscaleMultiplier {
+    return this.upscale;
+  }
+
   public setUpscaleMultiplier(multiplier: UpscaleMultiplier): void {
     this.upscale = multiplier;
     this.updateCanvasResolution();

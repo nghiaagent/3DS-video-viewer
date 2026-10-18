@@ -281,12 +281,13 @@ test.describe('Spatial 3DS Video Viewer E2E Suite (HNI_0062.AVI)', () => {
     const testResultsDir = path.resolve(process.cwd(), 'test-results');
     fs.mkdirSync(testResultsDir, { recursive: true });
 
-    const exportAndSave = async (format: 'mp4' | 'webm'): Promise<string> => {
-      const exportData = await page.evaluate(async (fmt) => {
+    const exportAndSave = async (format: 'mp4' | 'webm', frame: 'stage' | 'content' = 'content', fps = 30): Promise<string> => {
+      const exportData = await page.evaluate(async ({ fmt, frame, fps }) => {
         const app = (window as any).__viewerApp;
         const res = await app.exportOffline(fmt, {
           maxDurationSec: 0.5,
-          fps: 30,
+          fps,
+          frame,
           triggerDownload: false,
         });
 
@@ -306,9 +307,9 @@ test.describe('Spatial 3DS Video Viewer E2E Suite (HNI_0062.AVI)', () => {
           width: res.width,
           height: res.height,
         };
-      }, format);
+      }, { fmt: format, frame, fps });
 
-      const filePath = path.join(testResultsDir, `e2e_exported.${format}`);
+      const filePath = path.join(testResultsDir, `e2e_exported_${frame}.${format}`);
       fs.writeFileSync(filePath, Buffer.from(exportData.base64, 'base64'));
       return filePath;
     };
@@ -356,6 +357,25 @@ test.describe('Spatial 3DS Video Viewer E2E Suite (HNI_0062.AVI)', () => {
     expect(webmVideoStream.width).toBe(960);
     expect(webmVideoStream.height).toBe(480);
     console.log(`Verified WebM with ffprobe: codec=${webmVideoStream.codec_name}, ${webmVideoStream.width}x${webmVideoStream.height}`);
+
+    // 3. Full-stage exports (the default): the whole framed window at 1920x1080, 60 fps
+    const probe = (file: string) =>
+      JSON.parse(
+        execFileSync(FFPROBE_BIN, ['-v', 'quiet', '-print_format', 'json', '-show_streams', file], { encoding: 'utf-8' })
+      ).streams.find((st: any) => st.codec_type === 'video');
+
+    const stageMp4 = probe(await exportAndSave('mp4', 'stage', 60));
+    expect(stageMp4.codec_name).toBe('h264');
+    expect(stageMp4.width).toBe(1920);
+    expect(stageMp4.height).toBe(1080);
+    expect(stageMp4.r_frame_rate).toBe('60/1');
+    expect(Number(stageMp4.level)).toBeGreaterThanOrEqual(42); // 1080p60 needs level 4.2
+    expect(Number(stageMp4.nb_frames)).toBe(30); // 0.5 s at 60 fps
+
+    const stageWebm = probe(await exportAndSave('webm', 'stage', 60));
+    expect(stageWebm.codec_name).toBe('vp9');
+    expect(stageWebm.width).toBe(1920);
+    expect(stageWebm.height).toBe(1080);
   });
 
   test('5. Subpath URL Resolution & In-Browser FFmpeg Subpath Loading', async ({ page }) => {

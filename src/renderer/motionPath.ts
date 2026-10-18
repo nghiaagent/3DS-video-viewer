@@ -42,6 +42,18 @@ export function getOrbitOffset(tSec: number, settings: OrbitSettings = DEFAULT_O
   };
 }
 
+/**
+ * Orbit settings for a clip of the given length whose first and last frames match (a seamless loop): the speed is rounded
+ * to a whole number of orbits per clip. If that would change the speed by more than `tolerance` (short clips: a 2 s clip
+ * would need a full orbit in 2 s), the requested speed is kept and the clip simply does not loop.
+ */
+export function loopedOrbit(settings: OrbitSettings, durationSec: number, tolerance = 0.35): OrbitSettings {
+  const orbits = Math.round(settings.freqHz * durationSec);
+  if (orbits < 1) return settings;
+  const freqHz = orbits / durationSec;
+  return Math.abs(freqHz - settings.freqHz) <= tolerance * settings.freqHz ? { ...settings, freqHz } : settings;
+}
+
 /** Same, from an already accumulated phase (the live loop integrates phase so speed changes never jump). */
 export function getOrbitOffsetFromPhase(phase: number, amp: number, yRatio: number): MotionOffset {
   return { x: clampUnit(amp * Math.sin(phase)), y: clampUnit(amp * yRatio * Math.cos(phase)) };
