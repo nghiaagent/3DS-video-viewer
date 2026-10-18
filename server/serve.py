@@ -32,10 +32,10 @@ from da3_loader import load_model
 ROOT = Path(__file__).resolve().parent.parent
 DCIM_ROOT = Path(os.environ.get("DCIM_ROOT", Path.home() / "Downloads/3DS vids/DCIM")).resolve()
 CACHE = ROOT / "server/cache"
-RES_W, RES_H = int(os.environ.get("DA3_RES_W", 336)), int(os.environ.get("DA3_RES_H", 168))  # 2:1, multiples of 14
+RES_W, RES_H = int(os.environ.get("DA3_RES_W", 252)), int(os.environ.get("DA3_RES_H", 126))  # 2:1, multiples of 14
 OUT_W, OUT_H = 480, 240
 MAX_GB = float(os.environ.get("DA3_MAX_GB", 7.0))  # GPU allocator cap; + ~1GB process memory stays under 8GB total
-MAX_VIEWS = int(os.environ.get("DA3_MAX_VIEWS", 64))  # 32 frames x 2 eyes per pass; ~3.7GB at 336x168 (smaller windows were steadier in sweeps)
+MAX_VIEWS = int(os.environ.get("DA3_MAX_VIEWS", 256))  # 128 frames x 2 eyes per pass (chosen by eye over 64); ~4.8GB at 252x126
 DTYPE = os.environ.get("DA3_DTYPE", "bf16")
 
 app = FastAPI()
