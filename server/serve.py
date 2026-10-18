@@ -26,7 +26,7 @@ from fastapi.responses import FileResponse, JSONResponse, Response
 from starlette.concurrency import run_in_threadpool
 from starlette.staticfiles import StaticFiles
 
-from bench_maxviews import FFMPEG, build_mono_views, build_views, decode_eye, depth_of, run_model
+from bench_maxviews import FFMPEG, FFPROBE, build_mono_views, build_views, decode_eye, depth_of, run_model
 from da3_loader import load_model
 
 ROOT = Path(__file__).resolve().parent.parent
@@ -72,7 +72,7 @@ def safe_dcim(rel: str) -> Path:
 
 
 def video_fps(video: Path) -> float:
-    out = subprocess.run([FFMPEG.replace("ffmpeg", "ffprobe"), "-v", "error", "-select_streams", "v:0",
+    out = subprocess.run([FFPROBE, "-v", "error", "-select_streams", "v:0",
                           "-show_entries", "stream=avg_frame_rate", "-of", "csv=p=0", str(video)],
                          capture_output=True, text=True, check=True).stdout.strip()
     num, den = out.split("/")

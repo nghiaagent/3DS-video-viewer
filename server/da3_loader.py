@@ -13,7 +13,10 @@ sys.modules.setdefault("pycolmap", types.ModuleType("pycolmap"))
 
 
 def pick_device() -> str:
-    return "mps" if torch.backends.mps.is_available() else "cpu"
+    """Apple GPU (MPS) if present, else CUDA, else CPU (works, but is slow)."""
+    if torch.backends.mps.is_available():
+        return "mps"
+    return "cuda" if torch.cuda.is_available() else "cpu"
 
 
 def load_model(name: str = "depth-anything/DA3-BASE", device: str | None = None):

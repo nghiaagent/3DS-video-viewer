@@ -9,6 +9,7 @@ legitimately depends on which other views are in the pass).
 Stops at the first failure for that (res, dtype).
 """
 import argparse
+import shutil
 import subprocess
 import time
 from pathlib import Path
@@ -18,7 +19,8 @@ import torch
 
 from da3_loader import load_model
 
-FFMPEG = "/opt/homebrew/bin/ffmpeg"
+FFMPEG = shutil.which("ffmpeg") or "/opt/homebrew/bin/ffmpeg"
+FFPROBE = shutil.which("ffprobe") or "/opt/homebrew/bin/ffprobe"
 DEFAULT_VIDEO = Path.home() / "Downloads/3DS vids/DCIM/101NIN03/HNI_0062.AVI"
 MEAN = np.array([0.485, 0.456, 0.406], dtype=np.float32)
 STD = np.array([0.229, 0.224, 0.225], dtype=np.float32)
