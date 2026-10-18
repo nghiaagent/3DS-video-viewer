@@ -196,7 +196,7 @@ export class WebGLParallaxViewer {
   private verticalTilt: number = 0.0;
   private meshDepth: number = 0.6;
   private focus: number = 0.35;
-  private sensitivity: number = 0.28;
+  private sensitivity: number = 0.34; // parallax strength (the Depth slider); 0.28 until the depth-cues pass
 
   // Auto-Calibrated Stereo Convergence Baseline (range [-80, 24])
   private baseDisp: number = 8;

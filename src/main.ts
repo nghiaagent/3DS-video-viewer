@@ -63,6 +63,7 @@ const orbitSizeDockControl = document.getElementById('orbit-size-dock-control') 
 const cropSlider = document.getElementById('crop-slider') as HTMLInputElement | null;
 const maxdispSlider = document.getElementById('maxdisp-slider') as HTMLInputElement;
 const maxdispVal = document.getElementById('maxdisp-val') as HTMLElement | null;
+const focusSlider = document.getElementById('focus-slider') as HTMLInputElement | null;
 const freqSlider = document.getElementById('freq-slider') as HTMLInputElement | null;
 const ampSlider = document.getElementById('amp-slider') as HTMLInputElement | null;
 
@@ -378,11 +379,15 @@ if (cropSlider) {
   });
 }
 
+// Depth slider = parallax strength (how far layers move against each other)
 maxdispSlider.addEventListener('input', () => {
-  const val = parseInt(maxdispSlider.value, 10);
-  if (maxdispVal) maxdispVal.textContent = String(val);
-  viewer.setMaxDisparity(val);
+  const val = parseFloat(maxdispSlider.value);
+  if (maxdispVal) maxdispVal.textContent = val.toFixed(2);
+  viewer.setSensitivity(val);
 });
+
+// Focus slider = the depth that stays still while everything else moves
+focusSlider?.addEventListener('input', () => viewer.setFocus(parseFloat(focusSlider.value)));
 
 function updateMotionModeUI(mode: MotionMode) {
   const show = (el: HTMLElement | null, on: boolean) => {

@@ -126,10 +126,16 @@
         <input type="range" class="vision-slider speed-slider" id="amp-slider" data-testid="amp-slider" min="0.2" max="1" step="0.05" value="0.7" title="Orbit size" />
       </div>
 
-      <!-- Spatial Depth Slider -->
+      <!-- Parallax strength: how far near and far layers move against each other -->
       <div class="dock-control" id="depth-dock-control">
         <label for="maxdisp-slider" class="dock-label">Depth</label>
-        <input type="range" class="vision-slider depth-slider" id="maxdisp-slider" min="8" max="36" step="2" value="24" title="Depth" />
+        <input type="range" class="vision-slider depth-slider" id="maxdisp-slider" data-testid="depth-slider" min="0" max="0.6" step="0.02" value="0.34" title="Depth (parallax strength)" />
+      </div>
+
+      <!-- Focus plane: the depth that stays still while everything else moves -->
+      <div class="dock-control" id="focus-dock-control">
+        <label for="focus-slider" class="dock-label">Focus</label>
+        <input type="range" class="vision-slider" id="focus-slider" data-testid="focus-slider" min="0.05" max="0.9" step="0.01" value="0.35" title="Focus plane: what stays still while everything else moves" />
       </div>
 
       <!-- Manual Shift Slider (for Manual Mode) -->
@@ -153,6 +159,7 @@
           <option value="4">Side-by-Side</option>
         </select>
       </div>
+
     </footer>
 
     <!-- Hidden compatibility controls preserved for automation tests -->
@@ -182,7 +189,7 @@
       </div>
       <input id="crop-slider" type="range" min="0" max="0.15" step="0.01" value="0.06" />
       <span id="crop-val">0.06</span>
-      <span id="maxdisp-val">24</span>
+      <span id="maxdisp-val">0.34</span>
     </div>
 
     <script type="module" src="./src/main.ts"></script>
