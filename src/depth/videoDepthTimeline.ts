@@ -34,6 +34,7 @@ export interface VideoDepthTimelineOptions {
   workerV3?: Worker;
   wasmPaths?: Record<string, string> | string;
   modelPathV3?: string;
+  modelPathWebGPU?: string;
   initialKeyframes?: number; // default 12
   runFullStreamInBackground?: boolean; // default true
   frameExtractor?: (timeSec: number, frameIndex: number) => Promise<Uint8Array | null>;
@@ -95,8 +96,9 @@ class WorkerClient {
     return new Promise<'webgpu' | 'wasm'>((resolve, reject) => {
       const timeout = setTimeout(() => {
         this.worker.removeEventListener('message', handler);
+        console.warn('WorkerClient init timed out after 120s, falling back to wasm');
         resolve('wasm');
-      }, 15000);
+      }, 120000);
 
       const handler = (e: MessageEvent<WorkerOutMessage>) => {
         if (e.data.type === 'initDone') {
@@ -282,21 +284,30 @@ export class VideoDepthTimeline {
       ? new URL('./models/depthanythingv3.onnx', window.location.href).href
       : '/models/depthanythingv3.onnx';
 
+    const defaultModelWebGPU = typeof window !== 'undefined'
+      ? new URL('./models/depthanythingv3-base.onnx', window.location.href).href
+      : '/models/depthanythingv3-base.onnx';
+
+    const modelPath = this.options.modelPathV3 || defaultModelV3;
+    const modelPathWebGPU = this.options.modelPathWebGPU || (this.options.modelPathV3 ? undefined : defaultModelWebGPU);
+
     const poolSize = this.options.workerPoolSize ?? 2;
-    const workerUrl = this.options.workerUrl || new URL('./depthAnythingWorker.ts', import.meta.url);
 
     for (let i = 0; i < poolSize; i++) {
       let worker: Worker;
       if (i === 0 && this.options.workerV3) {
         worker = this.options.workerV3;
+      } else if (this.options.workerUrl) {
+        worker = new Worker(this.options.workerUrl, { type: 'module' });
       } else {
-        worker = new Worker(workerUrl, { type: 'module' });
+        worker = new Worker(new URL('./depthAnythingWorker.ts', import.meta.url), { type: 'module' });
       }
       const client = new WorkerClient(worker);
       await client.init({
         type: 'init',
         wasmPaths,
-        modelPath: this.options.modelPathV3 || defaultModelV3,
+        modelPath,
+        modelPathWebGPU,
         modelVersion: 'v3',
         preferWebGPU: true,
       });

@@ -977,14 +977,23 @@ export class DepthAnythingController {
     this.options.inputSize = this.options.inputSize || 392;
 
     const defaultModel = '/models/depthanythingv3.onnx';
-    const modelPath = typeof window !== 'undefined'
+    const defaultModelPath = typeof window !== 'undefined'
       ? new URL('.' + defaultModel, window.location.href).href
       : defaultModel;
+    const defaultModelWebGPU = typeof window !== 'undefined'
+      ? new URL('./models/depthanythingv3-base.onnx', window.location.href).href
+      : '/models/depthanythingv3-base.onnx';
+
+    const modelPath = this.options.modelPath || defaultModelPath;
+    const modelPathWebGPU = this.options.modelPathWebGPU || (this.options.modelPath ? undefined : defaultModelWebGPU);
     this.options.modelPath = modelPath;
+    if (modelPathWebGPU) {
+      this.options.modelPathWebGPU = modelPathWebGPU;
+    }
 
     if (this.worker && typeof this.worker.addEventListener === 'function') {
       await new Promise<void>((resolve, reject) => {
-        const timeout = setTimeout(() => resolve(), 15000);
+        const timeout = setTimeout(() => resolve(), 120000);
         const handler = (e: MessageEvent<WorkerOutMessage>) => {
           if (e.data.type === 'initDone') {
             clearTimeout(timeout);
@@ -992,7 +1001,7 @@ export class DepthAnythingController {
             this.initialized = true;
             this.worker?.removeEventListener('message', handler);
             resolve();
-          } else if (e.data.type === 'error') {
+          } else if (e.data.type === 'error' && !e.data.frameId) {
             clearTimeout(timeout);
             this.worker?.removeEventListener('message', handler);
             reject(new Error(e.data.error));
@@ -1088,16 +1097,22 @@ export class DepthAnythingController {
       const defaultModelPath = typeof window !== 'undefined'
         ? new URL('.' + defaultModel, window.location.href).href
         : defaultModel;
+      const defaultModelWebGPU = typeof window !== 'undefined'
+        ? new URL('./models/depthanythingv3-base.onnx', window.location.href).href
+        : '/models/depthanythingv3-base.onnx';
 
       const defaultWasmPaths = typeof window !== 'undefined'
         ? new URL('./onnx-wasm/', window.location.href).href
         : '/onnx-wasm/';
 
+      const modelPath = this.options.modelPath || defaultModelPath;
+      const modelPathWebGPU = this.options.modelPathWebGPU || (this.options.modelPath ? undefined : defaultModelWebGPU);
+
       const initMsg: WorkerInitMessage = {
         type: 'init',
         wasmPaths: this.options.wasmPaths || defaultWasmPaths,
-        modelPath: this.options.modelPath || defaultModelPath,
-        modelPathWebGPU: this.options.modelPathWebGPU,
+        modelPath,
+        modelPathWebGPU,
         preferWebGPU: true,
       };
 
@@ -1113,7 +1128,7 @@ export class DepthAnythingController {
       }
 
       await new Promise<void>((resolve, reject) => {
-        const timeout = setTimeout(() => resolve(), 15000);
+        const timeout = setTimeout(() => resolve(), 120000);
         const initHandler = (e: MessageEvent<WorkerOutMessage>) => {
           if (e.data.type === 'initDone') {
             clearTimeout(timeout);
@@ -1121,7 +1136,7 @@ export class DepthAnythingController {
             this.initialized = true;
             this.worker?.removeEventListener('message', initHandler);
             resolve();
-          } else if (e.data.type === 'error') {
+          } else if (e.data.type === 'error' && !e.data.frameId) {
             clearTimeout(timeout);
             this.worker?.removeEventListener('message', initHandler);
             reject(new Error(e.data.error));
@@ -1315,7 +1330,7 @@ export class DepthAnythingController {
     baseDisp?: number,
     maxDisp?: number
   ): boolean {
-    if (this.busy) {
+    if (!this.initialized || this.busy) {
       return false; // Skip frame to keep 60 FPS render loop fluid
     }
 

@@ -261,13 +261,14 @@ export async function initSession(options: {
   }
 
   const defaultModel = '/models/depthanythingv3.onnx';
+  const defaultModelBase = '/models/depthanythingv3-base.onnx';
   let modelPath = options.modelPath || defaultModel;
-  if (typeof self !== 'undefined' && self.location && !modelPath.startsWith('http://') && !modelPath.startsWith('https://') && !modelPath.startsWith('blob:')) {
+  if (typeof self !== 'undefined' && self.location && !modelPath.startsWith('http://') && !modelPath.startsWith('https://') && !modelPath.startsWith('blob:') && !modelPath.startsWith('file://')) {
     modelPath = new URL(modelPath, self.location.origin + '/').href;
   }
 
-  let modelPathWebGPU = options.modelPathWebGPU || modelPath;
-  if (typeof self !== 'undefined' && self.location && modelPathWebGPU && !modelPathWebGPU.startsWith('http://') && !modelPathWebGPU.startsWith('https://') && !modelPathWebGPU.startsWith('blob:')) {
+  let modelPathWebGPU = options.modelPathWebGPU || options.modelPath || defaultModelBase;
+  if (typeof self !== 'undefined' && self.location && modelPathWebGPU && !modelPathWebGPU.startsWith('http://') && !modelPathWebGPU.startsWith('https://') && !modelPathWebGPU.startsWith('blob:') && !modelPathWebGPU.startsWith('file://')) {
     modelPathWebGPU = new URL(modelPathWebGPU, self.location.origin + '/').href;
   }
 
@@ -279,18 +280,38 @@ export async function initSession(options: {
   let session: ort.InferenceSession | null = null;
   let backend: 'webgpu' | 'wasm' = 'wasm';
 
-  if (hasWebGPU && modelPathWebGPU) {
-    try {
-      session = await ort.InferenceSession.create(modelPathWebGPU, {
-        executionProviders: ['webgpu', 'wasm'],
-      });
-      backend = 'webgpu';
-    } catch (e) {
-      console.warn('DepthAnythingWorker: WebGPU init failed, falling back to WASM:', e);
+  if (hasWebGPU) {
+    if (modelPathWebGPU) {
+      try {
+        console.log(`[DepthAnythingWorker] Initializing WebGPU session with DA3-Base: ${modelPathWebGPU}`);
+        const t0 = performance.now();
+        session = await ort.InferenceSession.create(modelPathWebGPU, {
+          executionProviders: ['webgpu'],
+        });
+        backend = 'webgpu';
+        console.log(`[DepthAnythingWorker] Successfully initialized DA3-Base on WebGPU in ${(performance.now() - t0).toFixed(0)}ms!`);
+      } catch (e) {
+        console.warn('DepthAnythingWorker: WebGPU init for DA3-Base failed, trying DA3-Small on WebGPU:', e);
+      }
+    }
+
+    if (!session && modelPath) {
+      try {
+        console.log(`[DepthAnythingWorker] Initializing WebGPU session with DA3-Small: ${modelPath}`);
+        const t0 = performance.now();
+        session = await ort.InferenceSession.create(modelPath, {
+          executionProviders: ['webgpu'],
+        });
+        backend = 'webgpu';
+        console.log(`[DepthAnythingWorker] Successfully initialized DA3-Small on WebGPU in ${(performance.now() - t0).toFixed(0)}ms!`);
+      } catch (e) {
+        console.warn('DepthAnythingWorker: WebGPU init for DA3-Small failed, falling back to WASM:', e);
+      }
     }
   }
 
   if (!session) {
+    console.warn('[DepthAnythingWorker] Creating WASM InferenceSession (CPU fallback)...');
     session = await ort.InferenceSession.create(modelPath, {
       executionProviders: ['wasm'],
     });
