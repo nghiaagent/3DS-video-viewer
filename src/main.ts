@@ -11,6 +11,7 @@ import {
 } from './exporter/index.js';
 import { StageRenderer } from './exporter/stageRenderer.js';
 import { grainSeedForTime } from './renderer/grain.js';
+import { DEFAULT_GLOW, glowColors, glowEquals, quantizeGlow, smoothGlow, type GlowState } from './renderer/contentGlow.js';
 import { DepthAnythingController, VideoDepthTimeline } from './depth/stereoGuidedDepth.js';
 import {
   DEFAULT_ORBIT,
@@ -573,6 +574,29 @@ function resolveMotion(timestampMs: number, dtSeconds: number): MotionOffset {
   return getOrbitOffsetFromPhase(orbitPhase, orbitAmpCurrent, DEFAULT_ORBIT.yRatio);
 }
 
+// Ambient glow follows the picture's colour: smoothed every frame, written to CSS only when the quantised value changes
+let glowSmooth: GlowState = DEFAULT_GLOW;
+let glowShown: GlowState = quantizeGlow(DEFAULT_GLOW);
+let glowOverride: GlowState | null = null;
+let glowPrimed = false;
+function updateGlow(dtSeconds: number) {
+  const target = glowOverride ?? glowColors(viewer.getContentAverage());
+  if (!glowPrimed && (glowOverride || viewer.getContentAverage())) {
+    glowSmooth = target; // start from the first reading instead of fading in from cyan
+    glowPrimed = true;
+  } else {
+    glowSmooth = smoothGlow(glowSmooth, target, dtSeconds);
+  }
+  const q = quantizeGlow(glowSmooth);
+  if (glowEquals(q, glowShown)) return;
+  glowShown = q;
+  const root = document.documentElement.style;
+  root.setProperty('--glow-c1', q.c1.join(', '));
+  root.setProperty('--glow-c2', q.c2.join(', '));
+  root.setProperty('--glow-a1', q.a1.toFixed(3));
+  root.setProperty('--glow-a2', q.a2.toFixed(3));
+}
+
 // Main Animation & Parallax Render Loop (60 FPS) with Apple Vision Pro 3D Window Movement
 function renderLoop(timestampMs: number) {
   if (!isLoopRunning) return;
@@ -585,6 +609,7 @@ function renderLoop(timestampMs: number) {
 
   const offset = resolveMotion(timestampMs, dtSeconds);
   const { viewShift, verticalTilt } = offsetToRenderParams(offset);
+  updateGlow(dtSeconds);
 
   // Spatial window movement and reactive specular border (one pose function drives both axes)
   if (spatialWindow) {
@@ -596,7 +621,7 @@ function renderLoop(timestampMs: number) {
     spatialWindow.style.setProperty('--window-shift-y', pose.y.toFixed(3));
     spatialWindow.style.boxShadow =
       `${pose.shadowX.toFixed(1)}px ${pose.shadowY.toFixed(1)}px 80px rgba(0, 0, 0, 0.85), ` +
-      '0 0 90px rgba(56, 189, 248, 0.08), 0 0 0 1px rgba(255, 255, 255, 0.14)';
+      `0 0 90px rgba(${glowShown.c1.join(', ')}, 0.08), 0 0 0 1px rgba(255, 255, 255, 0.14)`;
 
     if (ambientGlow) {
       ambientGlow.style.transform = `translate3d(${pose.glowX.toFixed(1)}px, ${pose.glowY.toFixed(1)}px, 0px)`;
@@ -673,11 +698,17 @@ requestAnimationFrame(renderLoop);
   /** Renders the export stage for the pinned view direction at the given size; returns a PNG data URL. */
   renderStageSnapshot: (width: number, height: number, scale: number): string => {
     const stage = new StageRenderer(width, height, scale);
-    const canvasOut = stage.render(canvas, getWindowPose(motionOverride ?? { x: 0, y: 0 }));
+    const canvasOut = stage.render(canvas, getWindowPose(motionOverride ?? { x: 0, y: 0 }), glowShown);
     const url = canvasOut.toDataURL('image/png');
     stage.destroy();
     return url;
   },
+  setGlowOverride: (avg: [number, number, number] | null) => {
+    glowOverride = avg ? glowColors(avg) : null;
+    glowPrimed = false;
+    updateGlow(0);
+  },
+  getGlow: () => glowShown,
   hasExternalDepthMap: () => viewer.hasExternalDepthMap(),
   setDepthModel: (v: 'v3') => depthController.setModelVersion(v),
   setMotionMode: (mode: MotionMode) => {

@@ -57,3 +57,34 @@ test.describe('window finish', () => {
     expect(at(black, black.width >> 1, black.height >> 1)).toBe(0);
   });
 });
+
+test('glow takes the picture colour: CSS variables and the exported stage follow it', async ({ page }) => {
+  await page.goto('/');
+  await page.waitForFunction(() => !!(window as any).__viewerApp?.viewer);
+
+  // red-minus-blue just above the window, inside the glow
+  const redness = () =>
+    page.evaluate(async () => {
+      const app = (window as any).__viewerApp;
+      app.pauseRenderLoop();
+      const url = app.renderStageSnapshot(1372, 772, 1);
+      const img = new Image();
+      await new Promise((res) => { img.onload = res; img.src = url; });
+      const c = document.createElement('canvas');
+      c.width = img.naturalWidth; c.height = img.naturalHeight;
+      const g = c.getContext('2d')!;
+      g.drawImage(img, 0, 0);
+      const d = g.getImageData(686, 130, 1, 1).data;
+      return d[0] - d[2];
+    });
+
+  const css0 = await page.evaluate(() => getComputedStyle(document.documentElement).getPropertyValue('--glow-c1').trim());
+  expect(css0).toBe('56, 189, 248'); // the original cyan until a picture or override says otherwise
+  const cyan = await redness();
+
+  await page.evaluate(() => (window as any).__viewerApp.setGlowOverride([230, 40, 50]));
+  const css = await page.evaluate(() => getComputedStyle(document.documentElement).getPropertyValue('--glow-c1').trim());
+  const [r, , b] = css.split(',').map((x) => parseInt(x, 10));
+  expect(r).toBeGreaterThan(b);
+  expect(await redness()).toBeGreaterThan(cyan + 3);
+});

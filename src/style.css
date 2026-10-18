@@ -1,4 +1,9 @@
+/* Ambient glow colour; the page rewrites these from the picture (see contentGlow.ts) */
 :root {
+  --glow-c1: 56, 189, 248;
+  --glow-c2: 129, 140, 248;
+  --glow-a1: 0.18;
+  --glow-a2: 0.09;
   --bg-deep: #06070a;
   --glass-surface: rgba(26, 32, 48, 0.62);
   --glass-border: rgba(255, 255, 255, 0.14);
@@ -192,7 +197,7 @@ body {
   width: 900px;
   height: 480px;
   border-radius: 50%;
-  background: radial-gradient(circle, rgba(56, 189, 248, 0.18) 0%, rgba(129, 140, 248, 0.09) 45%, transparent 70%);
+  background: radial-gradient(circle, rgba(var(--glow-c1), var(--glow-a1)) 0%, rgba(var(--glow-c2), var(--glow-a2)) 45%, transparent 70%);
   filter: blur(80px);
   pointer-events: none;
   z-index: 1;

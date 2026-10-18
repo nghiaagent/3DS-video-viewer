@@ -10,6 +10,7 @@ import {
   type MotionOffset,
   type OrbitSettings,
 } from '../renderer/motionPath.js';
+import { glowColors, smoothGlow, type GlowState } from '../renderer/contentGlow.js';
 import { grainSeedForTime } from '../renderer/grain.js';
 import { StageRenderer } from './stageRenderer.js';
 
@@ -171,6 +172,7 @@ export async function exportOfflineGPUVideo(
   const dtMicros = Math.round(dtSec * 1_000_000);
   const lastSourceFrame = Math.max(0, Math.floor((sourceVideo.duration || 1) * sourceFps) - 1);
   let currentSourceFrame = -1;
+  let glow: GlowState | null = null; // follows the picture's colour, smoothed in export time
 
   try {
     for (let frameIdx = 0; frameIdx < totalFrames; frameIdx++) {
@@ -192,7 +194,9 @@ export async function exportOfflineGPUVideo(
       viewer.setGrainSeed(grainSeedForTime(sourceFrame / sourceFps, sourceFps));
       await viewer.renderVideoFrame(sourceVideo, viewShift, verticalTilt);
 
-      const source: HTMLCanvasElement = stage ? stage.render(canvas, getWindowPose(direction)) : canvas;
+      const glowTarget = glowColors(viewer.getContentAverage());
+      glow = glow ? smoothGlow(glow, glowTarget, dtSec) : glowTarget;
+      const source: HTMLCanvasElement = stage ? stage.render(canvas, getWindowPose(direction), glow) : canvas;
       const videoFrame = new VideoFrame(source, {
         timestamp: Math.round(tSec * 1_000_000),
         duration: dtMicros,

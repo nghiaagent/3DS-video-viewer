@@ -8,6 +8,7 @@ import { test, expect } from '@playwright/test';
 const STAGE = { width: 1372, height: 772 }; // 1372 - 64 > 960, so the page window is its full 960 x 480
 
 for (const pose of [
+  { name: 'tilted with a red glow', x: 0.5, y: 0.3, glow: [220, 40, 60] as [number, number, number] },
   { name: 'tilted right and up', x: 0.6, y: -0.4 },
   { name: 'tilted left and down', x: -0.7, y: 0.385 },
   { name: 'centred', x: 0, y: 0 },
@@ -20,7 +21,11 @@ for (const pose of [
     await page.addStyleTag({
       content: 'header, footer, #empty-state-overlay, #drop-overlay, #progress-banner, .glass-pill { display: none !important; }',
     });
-    await page.evaluate((p) => (window as any).__viewerApp.setMotionOverride({ x: p.x, y: p.y }), pose);
+    await page.evaluate((p) => {
+      const app = (window as any).__viewerApp;
+      app.setMotionOverride({ x: p.x, y: p.y });
+      if (p.glow) app.setGlowOverride(p.glow);
+    }, pose);
     await page.waitForTimeout(400); // let the live loop apply the pose to the page
 
     const stageUrl = await page.evaluate(

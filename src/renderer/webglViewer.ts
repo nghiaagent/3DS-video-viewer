@@ -224,6 +224,9 @@ export class WebGLParallaxViewer {
   private dispHeight: number = 44;
 
   // Offscreen canvas for fast baseline estimation from video elements
+  private contentAvg: [number, number, number] | null = null;
+  private avgCanvas: HTMLCanvasElement | OffscreenCanvas | null = null;
+  private avgCtx: CanvasRenderingContext2D | OffscreenCanvasRenderingContext2D | null = null;
   private baselineCanvas: HTMLCanvasElement | OffscreenCanvas | null = null;
   private baselineCtx: CanvasRenderingContext2D | OffscreenCanvasRenderingContext2D | null = null;
 
@@ -944,6 +947,50 @@ export class WebGLParallaxViewer {
     return bestD;
   }
 
+  /** Average colour (0..255) of the left-eye picture, refreshed every few frames; null before the first reading. */
+  public getContentAverage(): [number, number, number] | null {
+    return this.contentAvg;
+  }
+
+  /** Own small read of the left half of the video: independent of the baseline estimate, which is skipped for clips with metadata. */
+  private updateContentAverageFromVideo(video: TexImageSource): void {
+    const v = video as HTMLVideoElement;
+    const sw = v.videoWidth || (video as HTMLCanvasElement).width;
+    const sh = v.videoHeight || (video as HTMLCanvasElement).height;
+    if (!sw || !sh) return;
+    try {
+      if (!this.avgCanvas) {
+        if (typeof OffscreenCanvas !== 'undefined') {
+          this.avgCanvas = new OffscreenCanvas(48, 24);
+          this.avgCtx = this.avgCanvas.getContext('2d', { willReadFrequently: true }) as OffscreenCanvasRenderingContext2D;
+        } else if (typeof document !== 'undefined') {
+          const c = document.createElement('canvas');
+          c.width = 48;
+          c.height = 24;
+          this.avgCanvas = c;
+          this.avgCtx = c.getContext('2d', { willReadFrequently: true });
+        }
+      }
+      if (!this.avgCtx) return;
+      this.avgCtx.drawImage(video as CanvasImageSource, 0, 0, sw / 2, sh, 0, 0, 48, 24);
+      const d = this.avgCtx.getImageData(0, 0, 48, 24).data;
+      this.setContentAverageFromRgba(d, 1);
+    } catch {
+      // headless / tainted sources: keep the previous average
+    }
+  }
+
+  private setContentAverageFromRgba(rgba: ArrayLike<number>, stride: number): void {
+    let r = 0, g = 0, b = 0, n = 0;
+    for (let i = 0; i + 2 < rgba.length; i += 4 * stride) {
+      r += rgba[i];
+      g += rgba[i + 1];
+      b += rgba[i + 2];
+      n++;
+    }
+    if (n > 0) this.contentAvg = [r / n, g / n, b / n];
+  }
+
   private updateBaseDisparityFromRgba(rgba: Uint8Array, sbsWidth: number, sbsHeight: number): void {
     if (this.manualBaseDisp !== null) {
       this.baseDisp = this.manualBaseDisp;
@@ -1035,6 +1082,9 @@ export class WebGLParallaxViewer {
     if (this.frameCountTotal % 4 === 1 || this.frameCountTotal <= 2) {
       this.updateBaseDisparityFromVideo(video);
     }
+    if (this.frameCountTotal % 6 === 1 || this.contentAvg === null) {
+      this.updateContentAverageFromVideo(video);
+    }
 
     // 2. Upload source to sbsTexture directly on GPU
     gl.activeTexture(gl.TEXTURE0);
@@ -1122,6 +1172,17 @@ export class WebGLParallaxViewer {
     // Auto-converge global baseline
     if (this.frameCountTotal % 4 === 1 || this.frameCountTotal <= 2) {
       this.updateBaseDisparityFromRgba(sbsRgba, sbsWidth, sbsHeight);
+    }
+    if (this.frameCountTotal % 6 === 1 || this.contentAvg === null) {
+      // left half of every 8th row, every 8th pixel
+      const rows: number[] = [];
+      for (let y = 0; y < sbsHeight; y += 8) {
+        for (let x = 0; x < eyeW; x += 8) {
+          const i = (y * sbsWidth + x) * 4;
+          rows.push(sbsRgba[i], sbsRgba[i + 1], sbsRgba[i + 2], 255);
+        }
+      }
+      this.setContentAverageFromRgba(rows, 1);
     }
 
     // Upload SBS raw RGBA to GPU

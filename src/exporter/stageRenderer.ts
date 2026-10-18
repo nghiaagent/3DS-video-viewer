@@ -6,6 +6,7 @@
  * It owns a separate WebGL2 context: the viewer's canvas is uploaded as a texture each frame, and every output pixel is
  * mapped back onto the tilted window plane by a ray-plane intersection (the exact inverse of the CSS 3D transform).
  */
+import { DEFAULT_GLOW, type GlowState } from '../renderer/contentGlow.js';
 import { FRAME, windowBasis } from '../renderer/frameGeometry.js';
 import type { WindowPose } from '../renderer/motionPath.js';
 
@@ -40,6 +41,10 @@ uniform float u_specAngle;        // degrees, CSS convention (0 = toward the top
 
 uniform vec3 u_bg;
 uniform vec3 u_haloRgb;
+uniform vec3 u_glowC1;            // 0..1, from the picture's colour
+uniform vec3 u_glowC2;
+uniform float u_glowA1;
+uniform float u_glowA2;
 uniform float u_haloAlpha;
 uniform float u_haloSigma;
 uniform float u_shadowAlpha;
@@ -80,17 +85,17 @@ void main() {
         float rd = length(g);
         float stop1 = 0.45 * 510.0;                                  // gradient stops at 45% / 70% of the farthest-corner radius
         float stop2 = 0.70 * 510.0;
-        vec3 c1 = vec3(56.0, 189.0, 248.0) / 255.0;
-        vec3 c2 = vec3(129.0, 140.0, 248.0) / 255.0;
+        vec3 c1 = u_glowC1;
+        vec3 c2 = u_glowC2;
         float a;
         vec3 pre;                                                    // premultiplied, as CSS interpolates
         if (rd < stop1) {
             float t = rd / stop1;
-            a = mix(0.18, 0.09, t);
-            pre = mix(c1 * 0.18, c2 * 0.09, t);
+            a = mix(u_glowA1, u_glowA2, t);
+            pre = mix(c1 * u_glowA1, c2 * u_glowA2, t);
         } else if (rd < stop2) {
             float t = (rd - stop1) / (stop2 - stop1);
-            a = 0.09 * (1.0 - t);
+            a = u_glowA2 * (1.0 - t);
             pre = c2 * a;
         } else {
             a = 0.0;
@@ -182,7 +187,7 @@ export class StageRenderer {
     for (const name of [
       'content', 'stage', 'win', 'radius', 'scale', 'translate', 'ex', 'ey', 'persp', 'shadowOff', 'glowOff', 'poseX', 'poseY',
       'specAngle', 'bg', 'haloRgb', 'haloAlpha', 'haloSigma', 'shadowAlpha', 'shadowSigma', 'rimAlpha', 'borderAlpha',
-      'glowSize', 'glowSigma',
+      'glowSize', 'glowSigma', 'glowC1', 'glowC2', 'glowA1', 'glowA2',
     ]) {
       this.locs[name] = gl.getUniformLocation(this.program, `u_${name}`);
     }
@@ -233,7 +238,7 @@ export class StageRenderer {
   }
 
   /** Draws one frame: `content` is the viewer canvas, `pose` the window pose for the current view direction. */
-  render(content: HTMLCanvasElement, pose: WindowPose): HTMLCanvasElement {
+  render(content: HTMLCanvasElement, pose: WindowPose, glow: GlowState = DEFAULT_GLOW): HTMLCanvasElement {
     const gl = this.gl;
     const s = this.scale;
     const L = this.locs;
@@ -264,7 +269,12 @@ export class StageRenderer {
     gl.uniform1f(L.poseY, pose.y);
     gl.uniform1f(L.specAngle, pose.specAngleDeg);
     gl.uniform3f(L.bg, FRAME.background[0] / 255, FRAME.background[1] / 255, FRAME.background[2] / 255);
-    gl.uniform3f(L.haloRgb, FRAME.halo.rgb[0] / 255, FRAME.halo.rgb[1] / 255, FRAME.halo.rgb[2] / 255);
+    // The halo takes the glow's inner colour (with the default glow this is the original cyan)
+    gl.uniform3f(L.haloRgb, glow.c1[0] / 255, glow.c1[1] / 255, glow.c1[2] / 255);
+    gl.uniform3f(L.glowC1, glow.c1[0] / 255, glow.c1[1] / 255, glow.c1[2] / 255);
+    gl.uniform3f(L.glowC2, glow.c2[0] / 255, glow.c2[1] / 255, glow.c2[2] / 255);
+    gl.uniform1f(L.glowA1, glow.a1);
+    gl.uniform1f(L.glowA2, glow.a2);
     gl.uniform1f(L.haloAlpha, FRAME.halo.alpha);
     gl.uniform1f(L.haloSigma, (FRAME.halo.blur / 2) * s);
     gl.uniform1f(L.shadowAlpha, FRAME.shadow.alpha);
