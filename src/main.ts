@@ -5,6 +5,15 @@ import { import3DSVideo, type VideoSource } from './importer/import3DSVideo.js';
 import { exportParallaxVideo, exportOfflineGPUVideo, type ExportFormat, type ExportMode } from './exporter/index.js';
 import { DepthAnythingController, VideoDepthTimeline } from './depth/stereoGuidedDepth.js';
 import {
+  DEFAULT_ORBIT,
+  getOrbitOffsetFromPhase,
+  getWindowPose,
+  offsetToRenderParams,
+  viewShiftToX,
+  type MotionMode,
+  type MotionOffset,
+} from './renderer/motionPath.js';
+import {
   dcimPathFromUrl,
   fetchServerDepth,
   fetchServerDepthForFile,
@@ -48,6 +57,8 @@ const speedDockControl = document.getElementById('speed-dock-control') as HTMLEl
 const manualShiftGroup = document.getElementById('manual-shift-group') as HTMLElement | null;
 const manualShiftSlider = document.getElementById('manual-shift-slider') as HTMLInputElement | null;
 const manualShiftVal = document.getElementById('manual-shift-val') as HTMLElement | null;
+const manualTiltSlider = document.getElementById('manual-tilt-slider') as HTMLInputElement | null;
+const orbitSizeDockControl = document.getElementById('orbit-size-dock-control') as HTMLElement | null;
 
 const cropSlider = document.getElementById('crop-slider') as HTMLInputElement | null;
 const maxdispSlider = document.getElementById('maxdisp-slider') as HTMLInputElement;
@@ -105,7 +116,7 @@ viewer.setDepthProvider((timeSec: number) => {
 // True while the local DA3 server is computing depth for the clip being loaded; the in-browser depth controller must
 // stay idle then (it would otherwise load its own model and run per-frame inference on an empty timeline).
 let serverDepthPending = false;
-let motionMode: 'auto' | 'interactive' | 'manual' = 'auto';
+let motionMode: MotionMode = 'interactive';
 let isSeeking = false;
 let isExporting = false;
 let isLoopRunning = true;
@@ -373,25 +384,25 @@ maxdispSlider.addEventListener('input', () => {
   viewer.setMaxDisparity(val);
 });
 
-function updateMotionModeUI(mode: 'auto' | 'interactive' | 'manual') {
-  if (mode === 'manual') {
-    if (manualShiftGroup) manualShiftGroup.style.display = 'flex';
-    if (speedDockControl) speedDockControl.style.display = 'none';
-    motionController.detach();
-  } else if (mode === 'interactive') {
-    if (manualShiftGroup) manualShiftGroup.style.display = 'none';
-    if (speedDockControl) speedDockControl.style.display = 'none';
+function updateMotionModeUI(mode: MotionMode) {
+  const show = (el: HTMLElement | null, on: boolean) => {
+    if (el) el.style.display = on ? 'flex' : 'none';
+  };
+  show(manualShiftGroup, mode === 'manual');
+  show(speedDockControl, mode === 'orbit');
+  show(orbitSizeDockControl, mode === 'orbit');
+  if (mode === 'interactive') {
     motionController.attach(viewportContainer);
   } else {
-    // Gentle Sway mode
-    if (manualShiftGroup) manualShiftGroup.style.display = 'none';
-    if (speedDockControl) speedDockControl.style.display = 'flex';
     motionController.detach();
+  }
+  if (mode === 'orbit') {
+    orbitAmpCurrent = 0; // the circle grows out of the centre instead of snapping to a point on it
   }
 }
 
 motionModeSelect.addEventListener('change', () => {
-  motionMode = motionModeSelect.value as 'auto' | 'interactive' | 'manual';
+  motionMode = motionModeSelect.value as MotionMode;
   updateMotionModeUI(motionMode);
 });
 
@@ -475,9 +486,31 @@ async function triggerExport(format: ExportFormat) {
 exportMp4Btn.addEventListener('click', () => triggerExport('mp4'));
 exportWebmBtn.addEventListener('click', () => triggerExport('webm'));
 
-// Phase accumulator for smooth frequency transitions without teleporting
+// Orbit state: integrate the phase (so changing speed never makes the view jump) and ease the radius in
+// (so switching modes grows the circle smoothly).
 let lastTimestampMs = 0;
-let currentPhase = 0;
+let orbitPhase = 0;
+let orbitAmpCurrent = 0;
+const ORBIT_AMP_EASE_SEC = 0.4;
+
+/** Current view direction for the selected motion mode: x, y in [-1, 1]. */
+function resolveMotion(timestampMs: number, dtSeconds: number): MotionOffset {
+  if (motionMode === 'manual') {
+    return {
+      x: viewShiftToX(manualShiftSlider ? parseFloat(manualShiftSlider.value) : 0.5),
+      y: manualTiltSlider ? parseFloat(manualTiltSlider.value) : 0,
+    };
+  }
+  if (motionMode === 'interactive') {
+    const shift = motionController.update(timestampMs);
+    return { x: viewShiftToX(shift), y: motionController.getVerticalTilt() };
+  }
+  const freq = freqSlider ? parseFloat(freqSlider.value) : DEFAULT_ORBIT.freqHz;
+  const targetAmp = ampSlider ? parseFloat(ampSlider.value) : DEFAULT_ORBIT.amp;
+  orbitPhase = (orbitPhase + dtSeconds * freq * Math.PI * 2.0) % (Math.PI * 2.0);
+  orbitAmpCurrent += (targetAmp - orbitAmpCurrent) * (1 - Math.exp(-dtSeconds / ORBIT_AMP_EASE_SEC));
+  return getOrbitOffsetFromPhase(orbitPhase, orbitAmpCurrent, DEFAULT_ORBIT.yRatio);
+}
 
 // Main Animation & Parallax Render Loop (60 FPS) with Apple Vision Pro 3D Window Movement
 function renderLoop(timestampMs: number) {
@@ -489,39 +522,23 @@ function renderLoop(timestampMs: number) {
   const dtSeconds = Math.min(Math.max(0, (timestampMs - lastTimestampMs) / 1000.0), 0.1);
   lastTimestampMs = timestampMs;
 
-  let viewShift = 0.5;
+  const offset = resolveMotion(timestampMs, dtSeconds);
+  const { viewShift, verticalTilt } = offsetToRenderParams(offset);
 
-  if (motionMode === 'manual') {
-    viewShift = manualShiftSlider ? parseFloat(manualShiftSlider.value) : 0.5;
-  } else if (motionMode === 'interactive') {
-    viewShift = motionController.update(timestampMs);
-  } else {
-    // Gentle Sway mode: accumulate phase based on frequency slider to eliminate teleporting jumps
-    const freq = freqSlider ? parseFloat(freqSlider.value) : 0.28;
-    const amp = ampSlider ? parseFloat(ampSlider.value) : 0.42;
-    currentPhase = (currentPhase + dtSeconds * freq * Math.PI * 2.0) % (Math.PI * 2.0);
-    const sine = Math.sin(currentPhase);
-    viewShift = Math.max(0.0, Math.min(1.0, 0.5 + amp * sine));
-  }
-
-  // Enhanced Apple Vision Pro Spatial Window Movement & Reactive Specular Border
+  // Spatial window movement and reactive specular border (one pose function drives both axes)
   if (spatialWindow) {
-    const s = (viewShift - 0.5) * 2.0; // [-1.0, +1.0]
-    const v = motionController.getVerticalTilt(); // [-1.0, +1.0]
-
-    const tx = s * 26.0; // horizontal drift px
-    const ty = v * 10.0; // vertical drift px
-    const ry = -s * 8.0; // Y-axis rotation in degrees
-    const rx = v * 5.0;  // X-axis rotation in degrees
-
-    spatialWindow.style.transform = `translate3d(${tx.toFixed(2)}px, ${ty.toFixed(2)}px, 0px) rotateY(${ry.toFixed(2)}deg) rotateX(${rx.toFixed(2)}deg)`;
-    spatialWindow.style.setProperty('--window-shift', s.toFixed(3));
-
-    const shadowX = (-s * 32.0).toFixed(1);
-    spatialWindow.style.boxShadow = `${shadowX}px 32px 80px rgba(0, 0, 0, 0.85), 0 0 90px rgba(56, 189, 248, 0.08), 0 0 0 1px rgba(255, 255, 255, 0.14)`;
+    const pose = getWindowPose(offset);
+    spatialWindow.style.transform =
+      `translate3d(${pose.tx.toFixed(2)}px, ${pose.ty.toFixed(2)}px, 0px) ` +
+      `rotateY(${pose.rotateYDeg.toFixed(2)}deg) rotateX(${pose.rotateXDeg.toFixed(2)}deg)`;
+    spatialWindow.style.setProperty('--window-shift', pose.x.toFixed(3));
+    spatialWindow.style.setProperty('--window-shift-y', pose.y.toFixed(3));
+    spatialWindow.style.boxShadow =
+      `${pose.shadowX.toFixed(1)}px ${pose.shadowY.toFixed(1)}px 80px rgba(0, 0, 0, 0.85), ` +
+      '0 0 90px rgba(56, 189, 248, 0.08), 0 0 0 1px rgba(255, 255, 255, 0.14)';
 
     if (ambientGlow) {
-      ambientGlow.style.transform = `translate3d(${(-s * 50).toFixed(1)}px, 0px, 0px)`;
+      ambientGlow.style.transform = `translate3d(${pose.glowX.toFixed(1)}px, ${pose.glowY.toFixed(1)}px, 0px)`;
     }
   }
 
@@ -531,7 +548,6 @@ function renderLoop(timestampMs: number) {
 
   // Render on WebGL2 GPU
   if (sourceVideo.readyState >= HTMLMediaElement.HAVE_CURRENT_DATA && !isExporting) {
-    const verticalTilt = motionController.getVerticalTilt();
     viewer.renderVideoFrame(sourceVideo, viewShift, verticalTilt);
 
     if (!serverDepthPending && !depthController.isBusy()) {
@@ -551,6 +567,8 @@ function renderLoop(timestampMs: number) {
 }
 
 // Initial Boot Sequence
+motionModeSelect.value = motionMode;
+updateMotionModeUI(motionMode); // show only the controls that belong to the default mode
 requestAnimationFrame(renderLoop);
 
 // Expose on window for automated Playwright E2E tests and debugging
@@ -589,7 +607,7 @@ requestAnimationFrame(renderLoop);
   },
   hasExternalDepthMap: () => viewer.hasExternalDepthMap(),
   setDepthModel: (v: 'v3') => depthController.setModelVersion(v),
-  setMotionMode: (mode: 'auto' | 'interactive' | 'manual') => {
+  setMotionMode: (mode: MotionMode) => {
     motionMode = mode;
     motionModeSelect.value = mode;
     updateMotionModeUI(mode);

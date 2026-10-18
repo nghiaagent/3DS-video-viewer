@@ -36,6 +36,7 @@ export class MotionController {
   private currentVerticalTilt: number = 0.0;
   private targetVerticalTilt: number = 0.0;
   private isHovered: boolean = false;
+  private gyroActive: boolean = false;
   private options: Required<MotionOptions>;
 
   private onMouseMoveHandler = (e: MouseEvent) => this.onMouseMove(e);
@@ -60,6 +61,11 @@ export class MotionController {
   public attach(element: HTMLElement): void {
     this.detach();
     this.element = element;
+    // Start from rest: forget any pointer position left by an earlier mode (e.g. setManualShift).
+    this.mouseXNormalized = null;
+    this.mouseYNormalized = null;
+    this.isHovered = false;
+    this.gyroActive = false;
 
     element.addEventListener('mousemove', this.onMouseMoveHandler);
     element.addEventListener('mouseleave', this.onMouseLeaveHandler);
@@ -131,6 +137,7 @@ export class MotionController {
   private onDeviceOrientation(e: DeviceOrientationEvent): void {
     // Only use gyro if not hovering with mouse/touch
     if (this.isHovered || e.gamma === null) return;
+    this.gyroActive = true;
 
     // gamma represents left-to-right tilt in degrees [-90, 90]
     const clampedGamma = Math.max(-this.options.gyroSensitivity, Math.min(this.options.gyroSensitivity, e.gamma));
@@ -148,14 +155,15 @@ export class MotionController {
   /**
    * Advances the motion state and returns the current perspective shift in [0.0, 1.0].
    */
-  public update(timestampMs: number): number {
+  public update(_timestampMs: number): number {
     if (this.mouseXNormalized !== null) {
       this.targetShift = this.mouseXNormalized;
       if (this.mouseYNormalized !== null) {
         this.targetVerticalTilt = (this.mouseYNormalized - 0.5) * 2.0; // [-1, 1]
       }
-    } else if (!this.isHovered) {
-      this.targetShift = getPerspectiveShift(timestampMs, null, this.options);
+    } else if (!this.isHovered && !this.gyroActive) {
+      // No pointer and no device tilt: rest at the centre (never sway on its own).
+      this.targetShift = 0.5;
       this.targetVerticalTilt = 0.0;
     }
 

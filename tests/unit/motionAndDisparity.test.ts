@@ -62,6 +62,27 @@ describe('MotionController & Perspective Shift Math', () => {
     const updated = controller.update(0);
     expect(updated).toBeCloseTo(0.8, 3);
   });
+
+  it('MotionController rests at the centre when nothing is moving it (never sways on its own)', () => {
+    const controller = new MotionController(undefined, { dampingFactor: 0.5 });
+    for (let t = 0; t < 8000; t += 16) {
+      expect(controller.update(t)).toBeCloseTo(0.5, 6);
+      expect(controller.getVerticalTilt()).toBeCloseTo(0, 6);
+    }
+  });
+
+  it('MotionController.attach() forgets a stale manual position and eases back to the centre', () => {
+    const controller = new MotionController(undefined, { dampingFactor: 0.18 });
+    controller.setManualShift(0.9);
+    const fakeElement = { addEventListener() {}, removeEventListener() {} } as unknown as HTMLElement;
+    controller.attach(fakeElement);
+
+    const first = controller.update(0);
+    expect(first).toBeLessThan(0.9); // already heading back
+    let last = first;
+    for (let i = 0; i < 60; i++) last = controller.update(i * 16);
+    expect(last).toBeCloseTo(0.5, 2);
+  });
 });
 
 describe('GLSL Shader Sources & Perspective Warp UV Bounds', () => {

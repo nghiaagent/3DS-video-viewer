@@ -108,16 +108,22 @@
       <div class="dock-control">
         <label for="motion-mode-select" class="dock-label">Motion</label>
         <select class="vision-select" id="motion-mode-select">
-          <option value="auto">Gentle Sway</option>
-          <option value="interactive">Pointer & Tilt</option>
+          <option value="interactive" selected>Pointer & Tilt</option>
+          <option value="orbit">Orbit</option>
           <option value="manual">Manual</option>
         </select>
       </div>
 
-      <!-- Sway Speed Slider (for Gentle Sway) -->
-      <div class="dock-control" id="speed-dock-control">
+      <!-- Orbit Speed Slider (Orbit mode only) -->
+      <div class="dock-control" id="speed-dock-control" style="display: none;">
         <label for="freq-slider" class="dock-label">Speed</label>
-        <input type="range" class="vision-slider speed-slider" id="freq-slider" data-testid="freq-slider" min="0.08" max="0.80" step="0.02" value="0.28" title="Speed" />
+        <input type="range" class="vision-slider speed-slider" id="freq-slider" data-testid="freq-slider" min="0.05" max="0.60" step="0.01" value="0.18" title="Orbit speed" />
+      </div>
+
+      <!-- Orbit Size Slider (Orbit mode only) -->
+      <div class="dock-control" id="orbit-size-dock-control" style="display: none;">
+        <label for="amp-slider" class="dock-label">Size</label>
+        <input type="range" class="vision-slider speed-slider" id="amp-slider" data-testid="amp-slider" min="0.2" max="1" step="0.05" value="0.7" title="Orbit size" />
       </div>
 
       <!-- Spatial Depth Slider -->
@@ -131,6 +137,8 @@
         <label for="manual-shift-slider" class="dock-label">Shift</label>
         <input id="manual-shift-slider" type="range" class="vision-slider shift-slider" min="0" max="1" step="0.01" value="0.5" title="Shift" />
         <span id="manual-shift-val" style="display: none;">0.50</span>
+        <label for="manual-tilt-slider" class="dock-label">Tilt</label>
+        <input id="manual-tilt-slider" type="range" class="vision-slider shift-slider" min="-1" max="1" step="0.01" value="0" title="Tilt" />
       </div>
 
       <!-- View Mode Selector -->
@@ -175,8 +183,6 @@
       <input id="crop-slider" type="range" min="0" max="0.15" step="0.01" value="0.06" />
       <span id="crop-val">0.06</span>
       <span id="maxdisp-val">24</span>
-      <input id="amp-slider" type="range" min="0" max="0.5" step="0.01" value="0.42" />
-      <span id="amp-val">0.42</span>
     </div>
 
     <script type="module" src="./src/main.ts"></script>

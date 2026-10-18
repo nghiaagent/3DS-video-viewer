@@ -44,21 +44,37 @@ test.describe('Spatial 3DS Video Viewer E2E Suite (HNI_0062.AVI)', () => {
     expect(canvasDims.width).toBe(960);
     expect(canvasDims.height).toBe(480);
 
-    // 4. Verify Speed Slider is visible in Gentle Sway mode and hidden in other modes
+    // 4. Default motion is Pointer & Tilt: nothing sways on its own, and the Orbit controls are hidden
     const speedControl = page.locator('#speed-dock-control');
+    const sizeControl = page.locator('#orbit-size-dock-control');
     const freqSlider = page.locator('#freq-slider');
-    await expect(speedControl).toBeVisible();
-    await expect(freqSlider).toBeVisible();
-
     const motionModeSelect = page.locator('#motion-mode-select');
-    await motionModeSelect.selectOption('interactive');
+    await expect(motionModeSelect).toHaveValue('interactive');
     await expect(speedControl).toBeHidden();
+    await expect(sizeControl).toBeHidden();
+
+    const shiftReadout = page.locator('#telemetry-shift');
+    const shiftAtLoad = await shiftReadout.textContent();
+    await page.waitForTimeout(1500);
+    expect(await shiftReadout.textContent()).toBe(shiftAtLoad);
+    expect(shiftAtLoad).toBe('0.50');
+
+    // Orbit shows Speed and Size and genuinely moves; Manual hides them again
+    await motionModeSelect.selectOption('orbit');
+    await expect(speedControl).toBeVisible();
+    await expect(sizeControl).toBeVisible();
+    await expect(freqSlider).toBeVisible();
+    await page.waitForFunction(() => {
+      const el = document.getElementById('telemetry-shift');
+      return !!el && el.textContent !== '0.50';
+    }, null, { timeout: 5000 });
 
     await motionModeSelect.selectOption('manual');
     await expect(speedControl).toBeHidden();
+    await expect(sizeControl).toBeHidden();
 
-    await motionModeSelect.selectOption('auto');
-    await expect(speedControl).toBeVisible();
+    await motionModeSelect.selectOption('interactive');
+    await expect(speedControl).toBeHidden();
 
     // 5. Verify Circular Progress Rings are attached to export buttons with zero text status clutter
     const mp4Ring = page.locator('#export-mp4-btn .progress-ring');
