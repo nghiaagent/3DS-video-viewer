@@ -10,6 +10,7 @@ import {
   type MotionOffset,
   type OrbitSettings,
 } from '../renderer/motionPath.js';
+import { grainSeedForTime } from '../renderer/grain.js';
 import { StageRenderer } from './stageRenderer.js';
 
 export type ExportFormat = 'mp4' | 'webm';
@@ -97,7 +98,8 @@ export async function exportOfflineGPUVideo(
   const frameMode: ExportFrame = options?.frame ?? 'stage';
   const fps = options?.fps ?? 60;
   const sourceFps = options?.sourceFps ?? 20;
-  const bitrate = options?.bitrate ?? (frameMode === 'stage' ? 14_000_000 : 6_000_000);
+  // 16 Mbps for the stage: the fine film grain costs bits at 1080p60
+  const bitrate = options?.bitrate ?? (frameMode === 'stage' ? 16_000_000 : 6_000_000);
 
   // Determine export duration (default to video duration or max 30s)
   const durationSec = Math.min(
@@ -187,6 +189,7 @@ export async function exportOfflineGPUVideo(
       // Camera for this exact timestamp, from the same motion path the live viewer uses
       const direction = viewDirectionAt(tSec);
       const { viewShift, verticalTilt } = offsetToRenderParams(direction);
+      viewer.setGrainSeed(grainSeedForTime(sourceFrame / sourceFps, sourceFps));
       await viewer.renderVideoFrame(sourceVideo, viewShift, verticalTilt);
 
       const source: HTMLCanvasElement = stage ? stage.render(canvas, getWindowPose(direction)) : canvas;

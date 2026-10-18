@@ -10,6 +10,7 @@ import {
   type ExportMode,
 } from './exporter/index.js';
 import { StageRenderer } from './exporter/stageRenderer.js';
+import { grainSeedForTime } from './renderer/grain.js';
 import { DepthAnythingController, VideoDepthTimeline } from './depth/stereoGuidedDepth.js';
 import {
   DEFAULT_ORBIT,
@@ -591,6 +592,7 @@ function renderLoop(timestampMs: number) {
 
   // Render on WebGL2 GPU
   if (sourceVideo.readyState >= HTMLMediaElement.HAVE_CURRENT_DATA && !isExporting) {
+    viewer.setGrainSeed(grainSeedForTime(sourceVideo.currentTime));
     viewer.renderVideoFrame(sourceVideo, viewShift, verticalTilt);
 
     if (!serverDepthPending && !depthController.isBusy()) {

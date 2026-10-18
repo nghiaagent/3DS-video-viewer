@@ -144,6 +144,11 @@ export class WebGLParallaxViewer {
     maxDisparityUV: WebGLUniformLocation | null;
     zeroDispNorm: WebGLUniformLocation | null;
     baseDisp: WebGLUniformLocation | null;
+    canvasSize: WebGLUniformLocation | null;
+    edgeSoftness: WebGLUniformLocation | null;
+    edgeMotion: WebGLUniformLocation | null;
+    grain: WebGLUniformLocation | null;
+    grainSeed: WebGLUniformLocation | null;
   } = {
     sbsTexture: null,
     dispTexture: null,
@@ -160,6 +165,11 @@ export class WebGLParallaxViewer {
     maxDisparityUV: null,
     zeroDispNorm: null,
     baseDisp: null,
+    canvasSize: null,
+    edgeSoftness: null,
+    edgeMotion: null,
+    grain: null,
+    grainSeed: null,
   };
 
   private sbsTexture: WebGLTexture | null = null;
@@ -196,6 +206,9 @@ export class WebGLParallaxViewer {
   private verticalTilt: number = 0.0;
   private meshDepth: number = 0.6;
   private focus: number = 0.35;
+  private edgeSoftness: number = 0.8; // soft matte rim just inside the window edge; 0 = off
+  private grain: number = 0.012; // fine film grain amplitude; 0 = off
+  private grainSeed: number = 0;
   private sensitivity: number = 0.34; // parallax strength (the Depth slider); 0.28 until the depth-cues pass
 
   // Auto-Calibrated Stereo Convergence Baseline (range [-80, 24])
@@ -349,6 +362,11 @@ export class WebGLParallaxViewer {
       maxDisparityUV: gl.getUniformLocation(this.tieflingMeshProgram, 'u_maxDisparityUV'),
       zeroDispNorm: gl.getUniformLocation(this.tieflingMeshProgram, 'u_zeroDispNorm'),
       baseDisp: gl.getUniformLocation(this.tieflingMeshProgram, 'u_baseDisp'),
+      canvasSize: gl.getUniformLocation(this.tieflingMeshProgram, 'u_canvasSize'),
+      edgeSoftness: gl.getUniformLocation(this.tieflingMeshProgram, 'u_edgeSoftness'),
+      edgeMotion: gl.getUniformLocation(this.tieflingMeshProgram, 'u_edgeMotion'),
+      grain: gl.getUniformLocation(this.tieflingMeshProgram, 'u_grain'),
+      grainSeed: gl.getUniformLocation(this.tieflingMeshProgram, 'u_grainSeed'),
     };
 
     // Textures setup
@@ -623,6 +641,25 @@ export class WebGLParallaxViewer {
 
   public setSensitivity(sensitivity: number): void {
     this.sensitivity = Math.max(0.0, Math.min(2.0, sensitivity));
+  }
+
+  /** Strength of the soft, slightly dimmed rim just inside the window edge (0 = off, default 0.8). */
+  public setEdgeSoftness(softness: number): void {
+    this.edgeSoftness = Math.max(0.0, Math.min(1.0, softness));
+  }
+
+  public getEdgeSoftness(): number {
+    return this.edgeSoftness;
+  }
+
+  /** Film-grain amplitude (0 = off, default 0.012). */
+  public setGrain(grain: number): void {
+    this.grain = Math.max(0.0, Math.min(0.1, grain));
+  }
+
+  /** The grain pattern changes when this does; callers pass the source frame index so it changes at the footage's rate. */
+  public setGrainSeed(seed: number): void {
+    this.grainSeed = seed;
   }
 
   public getSensitivity(): number {
@@ -1256,6 +1293,14 @@ export class WebGLParallaxViewer {
       gl.uniform1f(this.tieflingLocs.windowCrop, this.windowCrop);
       gl.uniform1f(this.tieflingLocs.flipY, effectiveFlipY);
       gl.uniform1i(this.tieflingLocs.renderMode, 0);
+      gl.uniform2f(this.tieflingLocs.canvasSize, this.canvas.width, this.canvas.height);
+      gl.uniform1f(this.tieflingLocs.edgeSoftness, this.edgeSoftness);
+      gl.uniform1f(
+        this.tieflingLocs.edgeMotion,
+        Math.min(1.0, Math.max(Math.abs(clampedShift - 0.5) * 2.0, Math.abs(this.verticalTilt)))
+      );
+      gl.uniform1f(this.tieflingLocs.grain, this.grain);
+      gl.uniform1f(this.tieflingLocs.grainSeed, this.grainSeed);
 
       if (this.tieflingLocs.eyeTexelSize) {
         gl.uniform2f(this.tieflingLocs.eyeTexelSize, 1.0 / this.eyeWidth, 1.0 / this.eyeHeight);

@@ -382,6 +382,22 @@ uniform float u_zeroDispNorm;    // default 0.5
 uniform int u_baseDisp;          // global horizontal baseline convergence offset (pixels)
 uniform int u_renderMode;        // 0: Parallax 3D Mesh, 1: Heatmap, 2: Left, 3: Right, 4: SBS, 5: Anaglyph
 
+// Mode 0 window finish (see the rim and grain code in mode 0 below)
+uniform vec2 u_canvasSize;       // canvas size in px
+uniform float u_edgeSoftness;    // strength of the soft rim, 0 = off
+uniform float u_edgeMotion;      // 0..1: how far the view is turned (edge distortion grows with it)
+uniform float u_grain;           // film-grain amplitude, 0 = off
+uniform float u_grainSeed;       // changes at the source frame rate
+
+float sdRoundRectPx(vec2 p, vec2 halfSize, float r) {
+    vec2 q = abs(p) - (halfSize - vec2(r));
+    return length(max(q, 0.0)) + min(max(q.x, q.y), 0.0) - r;
+}
+
+float grainNoise(vec2 cell, float seed) {
+    return fract(sin(dot(cell + vec2(seed * 7.13, seed * 3.71), vec2(127.1, 311.7))) * 43758.5453);
+}
+
 // Google Turbo colormap for perceptually uniform depth heatmap visualization
 vec3 turboColormap(float x) {
     const vec4 kRedVec4 = vec4(0.13572138, 4.61539260, -42.66032258, 132.13108234);
@@ -442,18 +458,43 @@ void main() {
         float rightBlend = smoothstep(0.35, 0.85, u_viewShift) * stereoAgreement * 0.65;
         vec3 stereoColor = mix(colorL, colorR, rightBlend);
 
-        // Subtle rounded corner portal mask (cornerRadius = 0.025)
-        vec2 edgeDist = min(v_uv, 1.0 - v_uv);
-        float cornerRadius = 0.025;
-        vec2 cornerD = max(vec2(0.0), vec2(cornerRadius) - edgeDist);
-        float cornerDist = length(cornerD);
-        float portalMask = 1.0 - smoothstep(cornerRadius - 0.005, cornerRadius, cornerDist);
+        vec3 col = stereoColor;
 
-        // Ambient border feathering
-        float rimDist = min(edgeDist.x, edgeDist.y);
-        float frameAlpha = smoothstep(0.0, 0.008, rimDist);
+        // Window edge in SCREEN pixels, with the same rounded corners as the page's window (28 px at a 960 px canvas).
+        // Measured on gl_FragCoord rather than v_uv: the mesh is only pinned at its very border, so content can be pushed
+        // into the band and must still be softened there.
+        vec2 halfSize = 0.5 * u_canvasSize;
+        vec2 pc = gl_FragCoord.xy - halfSize;
+        float radiusPx = 28.0 * (u_canvasSize.x / 960.0);
+        float sd = sdRoundRectPx(pc, halfSize, radiusPx);                 // negative inside the window
 
-        outColor = vec4(stereoColor * portalMask * frameAlpha, 1.0);
+        // Vision-Pro-style soft rim: in a band just inside the edge the picture softens and dims a little (a faint matte
+        // border), more while the view is turned. Not depth-based.
+        float rim = 1.0 - smoothstep(0.0, 0.035 * u_canvasSize.x, -sd);
+        float wRim = clamp(rim * u_edgeSoftness * (0.45 + 0.55 * u_edgeMotion), 0.0, 1.0);
+        if (wRim > 0.002) {
+            float radius = 1.0 + 5.0 * wRim;                              // eye-texture texels, so exports (a bigger canvas) match
+            vec3 acc = colorL;
+            for (int i = 0; i < 16; i++) {
+                float a = float(i) * 2.399963;                            // golden angle
+                float r = radius * sqrt((float(i) + 0.5) / 16.0);
+                vec2 uv = eyeUV + vec2(cos(a), sin(a)) * r * u_eyeTexelSize;
+                uv = clamp(uv, vec2(u_windowCrop + 0.002, 0.002), vec2(0.998 - u_windowCrop, 0.998));   // stay in the active picture
+                acc += textureLod(u_sbsTexture, vec2(uv.x * 0.5, uv.y), 0.0).rgb;
+            }
+            col = mix(col, acc / 17.0, wRim);
+            col *= mix(1.0, 0.86, wRim);
+        }
+
+        // Fine film grain: 2 px cells, strongest in the mid-tones so blacks and the dark rim stay clean.
+        if (u_grain > 0.0) {
+            float L = dot(col, vec3(0.299, 0.587, 0.114));
+            float n = grainNoise(floor(gl_FragCoord.xy * 0.5), u_grainSeed) * 2.0 - 1.0;
+            col += n * u_grain * 4.0 * L * (1.0 - L);
+        }
+
+        float mask = 1.0 - smoothstep(-0.5, 0.5, sd);
+        outColor = vec4(col * mask, 1.0);
         return;
     }
 
