@@ -366,14 +366,31 @@ body {
 .floating-dock {
   position: absolute;
   bottom: 24px;
-  height: 56px;
-  border-radius: 9999px;
+  border-radius: 28px;
+  display: flex;
+  flex-direction: column;
+  align-items: stretch;
+  gap: 0.55rem;
+  padding: 0.65rem 1.25rem;
+  z-index: 50;
+  max-width: calc(100vw - 40px);
+}
+
+/* Two rows: transport on top, view controls below. The controls row wraps on narrow windows. */
+.dock-row {
   display: flex;
   align-items: center;
   gap: 0.85rem;
-  padding: 0 1.25rem;
-  z-index: 50;
-  max-width: calc(100vw - 40px);
+}
+
+.dock-transport .timeline-container {
+  flex: 1;
+}
+
+.dock-controls {
+  flex-wrap: wrap;
+  justify-content: center;
+  gap: 0.5rem 1.1rem;
 }
 
 .dock-btn {
@@ -492,6 +509,7 @@ body {
 }
 
 #seek-bar {
-  width: 130px;
+  flex: 1;
+  min-width: 90px;
 }
 

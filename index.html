@@ -89,6 +89,7 @@
 
     <!-- Bottom Spatial Floating Dock -->
     <footer class="floating-dock glass-pill">
+      <div class="dock-row dock-transport">
       <button class="dock-btn play-btn" id="play-pause-btn" data-testid="play-pause-btn" aria-label="Play or Pause">
         <span id="play-icon">▶</span>
       </button>
@@ -101,8 +102,9 @@
       <button class="dock-btn mute-btn" id="mute-btn" data-testid="mute-btn" aria-label="Toggle Sound">
         <span id="mute-icon">🔊</span>
       </button>
+      </div>
 
-      <div class="dock-divider"></div>
+      <div class="dock-row dock-controls">
 
       <!-- Motion Selector -->
       <div class="dock-control">
@@ -158,6 +160,7 @@
           <option value="1">Depth Map</option>
           <option value="4">Side-by-Side</option>
         </select>
+      </div>
       </div>
 
     </footer>
