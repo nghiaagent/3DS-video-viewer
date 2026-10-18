@@ -114,7 +114,8 @@ void main() {
     }
 
     // Tiefling 3D Parallax Mesh mode
-    vec2 sampleUV = clamp(vec2(u_windowCrop + uv.x * (1.0 - 2.0 * u_windowCrop), uv.y), 0.0, 1.0);
+    // The crop trims the same fraction from every side, so the 2:1 picture is zoomed, never stretched
+    vec2 sampleUV = clamp(vec2(u_windowCrop) + uv * (1.0 - 2.0 * u_windowCrop), 0.0, 1.0);
     float depth;
     if (u_dispTexelSize.x < 0.005) {
         // High-resolution DepthAnything V3: edge-aware foreground-preserving 5-tap filter at ±0.75 texel offsets
@@ -436,11 +437,11 @@ void main() {
         return;
     }
 
-    // Active 400x240 (5:3) 3DS window inside 480x240 frame
+    // Active picture: the same fraction is trimmed from all four sides, keeping the 2:1 aspect
     float activeWidth = 1.0 - (2.0 * u_windowCrop);
     vec2 eyeUV = vec2(
         clamp(u_windowCrop + v_uv.x * activeWidth, 0.002, 0.998),
-        clamp(v_uv.y, 0.002, 0.998)
+        clamp(u_windowCrop + v_uv.y * activeWidth, 0.002, 0.998)
     );
 
     // Mode 0: Tiefling 3D Parallax Mesh mode
@@ -479,7 +480,7 @@ void main() {
                 float a = float(i) * 2.399963;                            // golden angle
                 float r = radius * sqrt((float(i) + 0.5) / 16.0);
                 vec2 uv = eyeUV + vec2(cos(a), sin(a)) * r * u_eyeTexelSize;
-                uv = clamp(uv, vec2(u_windowCrop + 0.002, 0.002), vec2(0.998 - u_windowCrop, 0.998));   // stay in the active picture
+                uv = clamp(uv, vec2(u_windowCrop + 0.002), vec2(0.998 - u_windowCrop));   // stay in the active picture
                 acc += textureLod(u_sbsTexture, vec2(uv.x * 0.5, uv.y), 0.0).rgb;
             }
             col = mix(col, acc / 17.0, wRim);
