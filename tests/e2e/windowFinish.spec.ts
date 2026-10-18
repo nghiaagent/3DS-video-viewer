@@ -31,14 +31,14 @@ test.describe('window finish', () => {
     await page.waitForFunction(() => !!(window as any).__viewerApp?.viewer);
   });
 
-  test('the rim dims the picture near the edge and leaves the interior alone', async ({ page }) => {
+  test('the rim fades the picture toward warm white near the edge and leaves the interior alone', async ({ page }) => {
     const r = await renderFlat(page, 200, { soft: 0.8, shift: 1 });
     const mid = at(r, r.width >> 1, r.height >> 1);
     const nearEdge = at(r, r.width >> 1, 3);
     expect(mid).toBeGreaterThan(190);
-    expect(nearEdge).toBeLessThan(mid * 0.95);
+    expect(nearEdge).toBeGreaterThan(mid + 8); // red channel lifts toward the warm white (255, 237, 209)
     const off = await renderFlat(page, 200, { soft: 0, shift: 1 });
-    expect(at(off, off.width >> 1, 3)).toBeGreaterThan(190);
+    expect(Math.abs(at(off, off.width >> 1, 3) - 200)).toBeLessThan(3);
   });
 
   test('grain is mean-neutral, seeded, and absent on black', async ({ page }) => {

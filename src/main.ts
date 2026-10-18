@@ -11,6 +11,7 @@ import {
 } from './exporter/index.js';
 import { StageRenderer } from './exporter/stageRenderer.js';
 import { grainSeedForTime } from './renderer/grain.js';
+import { FRAME } from './renderer/frameGeometry.js';
 import { DEFAULT_GLOW, glowColors, glowEquals, quantizeGlow, smoothGlow, type GlowState } from './renderer/contentGlow.js';
 import { DepthAnythingController, VideoDepthTimeline } from './depth/stereoGuidedDepth.js';
 import {
@@ -621,7 +622,8 @@ function renderLoop(timestampMs: number) {
     spatialWindow.style.setProperty('--window-shift-y', pose.y.toFixed(3));
     spatialWindow.style.boxShadow =
       `${pose.shadowX.toFixed(1)}px ${pose.shadowY.toFixed(1)}px 80px rgba(0, 0, 0, 0.85), ` +
-      `0 0 90px rgba(${glowShown.c1.join(', ')}, 0.08), 0 0 0 1px rgba(255, 255, 255, 0.14)`;
+      `0 0 90px rgba(${glowShown.c1.join(', ')}, 0.08), ` +
+      `0 0 ${FRAME.edge.outerBlur}px rgba(${FRAME.edge.rgb.join(', ')}, ${FRAME.edge.outerAlpha})`;
 
     if (ambientGlow) {
       ambientGlow.style.transform = `translate3d(${pose.glowX.toFixed(1)}px, ${pose.glowY.toFixed(1)}px, 0px)`;

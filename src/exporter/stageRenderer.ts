@@ -49,8 +49,12 @@ uniform float u_haloAlpha;
 uniform float u_haloSigma;
 uniform float u_shadowAlpha;
 uniform float u_shadowSigma;
-uniform float u_rimAlpha;
+uniform vec3 u_edgeRgb;           // warm-white border glow
 uniform float u_borderAlpha;
+uniform float u_innerAlpha;
+uniform float u_innerSigma;       // px
+uniform float u_outerAlpha;
+uniform float u_outerSigma;       // px
 uniform vec2 u_glowSize;          // reference px
 uniform float u_glowSigma;        // px
 
@@ -83,8 +87,9 @@ void main() {
     {
         vec2 g = (q - u_glowOff) / u_scale;                          // reference px
         float rd = length(g);
-        float stop1 = 0.45 * 510.0;                                  // gradient stops at 45% / 70% of the farthest-corner radius
-        float stop2 = 0.70 * 510.0;
+        float reach = 0.5 * length(u_glowSize);                      // CSS circle gradient: farthest-corner radius
+        float stop1 = 0.45 * reach;                                  // gradient stops at 45% / 70% of it
+        float stop2 = 0.70 * reach;
         vec3 c1 = u_glowC1;
         vec3 c2 = u_glowC2;
         float a;
@@ -120,14 +125,15 @@ void main() {
     vec2 hs = 0.5 * u_win;
     float sd = sdRoundRect(local, hs, u_radius);                      // negative inside the window
 
-    // ---- shadows, drawn in the window plane so they tilt with it; bottom to top: rim, halo, drop shadow ----
-    float ring = (1.0 - smoothstep(u_scale - 0.5, u_scale + 0.5, sd)) * smoothstep(-0.5, 0.5, sd);
-    col = mix(col, vec3(1.0), ring * u_rimAlpha);
-    col = mix(col, u_haloRgb, blurredCoverage(sd, u_haloSigma) * u_haloAlpha);
+    // ---- halo, drop shadow and outer glow, drawn in the window plane so they tilt with it. Like a CSS box-shadow they are
+    // only painted outside the window's box. Bottom to top: halo, drop shadow, warm glow. ----
+    float outside = smoothstep(-0.5, 0.5, sd);
+    col = mix(col, u_haloRgb, blurredCoverage(sd, u_haloSigma) * u_haloAlpha * outside);
     float sdShadow = sdRoundRect(local - u_shadowOff, hs, u_radius);
-    col = mix(col, vec3(0.0), blurredCoverage(sdShadow, u_shadowSigma) * u_shadowAlpha);
+    col = mix(col, vec3(0.0), blurredCoverage(sdShadow, u_shadowSigma) * u_shadowAlpha * outside);
+    col = mix(col, u_edgeRgb, blurredCoverage(sd, u_outerSigma) * u_outerAlpha * outside);
 
-    // ---- the window: live picture, glass highlight, edge ring ----
+    // ---- the window: live picture, glass sheen, warm inner glow, edge line ----
     float inside = 1.0 - smoothstep(-0.5, 0.5, sd);
     if (inside > 0.0) {
         vec3 pic = texture(u_content, local / u_win + 0.5).rgb;
@@ -141,14 +147,17 @@ void main() {
         float spec = t < 0.4 ? mix(a0, 0.03, t / 0.4) : mix(0.03, 0.0, clamp((t - 0.4) / 0.3, 0.0, 1.0));
         col = mix(col, vec3(1.0), spec * inside);
 
-        float border = smoothstep(-u_scale - 0.5, -u_scale + 0.5, sd) * inside;     // 1 px ring just inside the edge
-        col = mix(col, vec3(1.0), border * u_borderAlpha);
+        // inset glow: the blurred region outside the window, seen from inside
+        col = mix(col, u_edgeRgb, blurredCoverage(-sd, u_innerSigma) * u_innerAlpha * inside);
 
         // inset 0 1px 0: a 1 px line along the top edge, just inside the border
         float fromTop = local.y + hs.y;
         float line = smoothstep(u_scale - 0.5, u_scale + 0.5, fromTop) * (1.0 - smoothstep(2.0 * u_scale - 0.5, 2.0 * u_scale + 0.5, fromTop));
         float flatTop = 1.0 - smoothstep(hs.x - u_radius - 1.0, hs.x - u_radius + 1.0, abs(local.x));
         col = mix(col, vec3(1.0), line * flatTop * inside * (0.35 + u_poseX * 0.15));
+
+        float border = smoothstep(-u_scale - 0.5, -u_scale + 0.5, sd) * inside;     // 1 px line just inside the edge
+        col = mix(col, u_edgeRgb, border * u_borderAlpha);
     }
 
     outColor = vec4(clamp(col, 0.0, 1.0), 1.0);
@@ -186,7 +195,7 @@ export class StageRenderer {
     this.program = this.link(VERTEX_SOURCE, FRAGMENT_SOURCE);
     for (const name of [
       'content', 'stage', 'win', 'radius', 'scale', 'translate', 'ex', 'ey', 'persp', 'shadowOff', 'glowOff', 'poseX', 'poseY',
-      'specAngle', 'bg', 'haloRgb', 'haloAlpha', 'haloSigma', 'shadowAlpha', 'shadowSigma', 'rimAlpha', 'borderAlpha',
+      'specAngle', 'bg', 'haloRgb', 'haloAlpha', 'haloSigma', 'shadowAlpha', 'shadowSigma', 'edgeRgb', 'borderAlpha', 'innerAlpha', 'innerSigma', 'outerAlpha', 'outerSigma',
       'glowSize', 'glowSigma', 'glowC1', 'glowC2', 'glowA1', 'glowA2',
     ]) {
       this.locs[name] = gl.getUniformLocation(this.program, `u_${name}`);
@@ -279,8 +288,13 @@ export class StageRenderer {
     gl.uniform1f(L.haloSigma, (FRAME.halo.blur / 2) * s);
     gl.uniform1f(L.shadowAlpha, FRAME.shadow.alpha);
     gl.uniform1f(L.shadowSigma, (FRAME.shadow.blur / 2) * s);
-    gl.uniform1f(L.rimAlpha, FRAME.rimAlpha);
-    gl.uniform1f(L.borderAlpha, FRAME.borderAlpha);
+    const E = FRAME.edge;
+    gl.uniform3f(L.edgeRgb, E.rgb[0] / 255, E.rgb[1] / 255, E.rgb[2] / 255);
+    gl.uniform1f(L.borderAlpha, E.borderAlpha);
+    gl.uniform1f(L.innerAlpha, E.innerAlpha);
+    gl.uniform1f(L.innerSigma, (E.innerBlur / 2) * s);
+    gl.uniform1f(L.outerAlpha, E.outerAlpha);
+    gl.uniform1f(L.outerSigma, (E.outerBlur / 2) * s);
     gl.uniform2f(L.glowSize, FRAME.glow.width, FRAME.glow.height);
     gl.uniform1f(L.glowSigma, FRAME.glow.blur * s);
 

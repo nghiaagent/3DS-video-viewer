@@ -469,8 +469,8 @@ void main() {
         float radiusPx = 28.0 * (u_canvasSize.x / 960.0);
         float sd = sdRoundRectPx(pc, halfSize, radiusPx);                 // negative inside the window
 
-        // Vision-Pro-style soft rim: in a band just inside the edge the picture softens and dims a little (a faint matte
-        // border), more while the view is turned. Not depth-based.
+        // Soft rim: in a band just inside the edge the picture blurs and fades toward warm white (the border glows), more
+        // while the view is turned. Not depth-based.
         float rim = 1.0 - smoothstep(0.0, 0.035 * u_canvasSize.x, -sd);
         float wRim = clamp(rim * u_edgeSoftness * (0.45 + 0.55 * u_edgeMotion), 0.0, 1.0);
         if (wRim > 0.002) {
@@ -484,7 +484,8 @@ void main() {
                 acc += textureLod(u_sbsTexture, vec2(uv.x * 0.5, uv.y), 0.0).rgb;
             }
             col = mix(col, acc / 17.0, wRim);
-            col *= mix(1.0, 0.86, wRim);
+            // warm white wash, strongest at the very edge; a fixed part so the glow also shows at rest
+            col = mix(col, vec3(1.0, 0.93, 0.82), 0.6 * rim * u_edgeSoftness * (0.55 + 0.45 * u_edgeMotion));
         }
 
         // Fine film grain: 2 px cells, strongest in the mid-tones so blacks and the dark rim stay clean.

@@ -13,12 +13,12 @@ export interface GlowState {
   a2: number;
 }
 
-/** The original cyan / indigo glow; used for black or unreadable frames and before the first measurement. */
+/** The cyan / indigo glow; used for black or unreadable frames and before the first measurement. */
 export const DEFAULT_GLOW: GlowState = {
   c1: [56, 189, 248],
   c2: [129, 140, 248],
-  a1: 0.18,
-  a2: 0.09,
+  a1: 0.32,
+  a2: 0.16,
 };
 
 const clamp = (x: number, lo: number, hi: number) => Math.min(hi, Math.max(lo, x));
@@ -40,7 +40,7 @@ export function glowColors(avg: Rgb | null | undefined): GlowState {
   if (peak < 1e-6) return DEFAULT_GLOW;
   sat = sat.map((v) => (v / peak) * 255) as Rgb;
 
-  const a1 = 0.18 * clamp(brightness, 0.35, 1);
+  const a1 = DEFAULT_GLOW.a1 * clamp(brightness, 0.5, 1);
   const own: GlowState = { c1: sat, c2: mixRgb(sat, DEFAULT_GLOW.c2, 0.3), a1, a2: a1 / 2 };
   const w = smoothstep(0.02, 0.12, brightness); // 0 near black: no threshold jump
   return {

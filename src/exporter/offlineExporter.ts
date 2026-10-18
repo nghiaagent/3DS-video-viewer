@@ -69,7 +69,8 @@ export interface ExportResult {
 /** Stage export geometry: a 1920x1080 stage with the window at 1.4x its reference size (1344 x 672), centred. */
 export const STAGE_WIDTH = 1920;
 export const STAGE_HEIGHT = 1080;
-export const STAGE_SCALE = 1.4;
+/** 2.25: the 960 x 480 window becomes 2160 x 1080, as tall as the video (the sides crop a little at rest, more when tilted). */
+export const STAGE_SCALE = 2.25;
 
 /** Codecs to try, best first. 1080p60 needs H.264 level 4.2 / VP9 level 4.1; the older strings are the fallbacks. */
 const STAGE_CODECS: Record<ExportFormat, string[]> = {
@@ -115,8 +116,8 @@ export async function exportOfflineGPUVideo(
   const orbit: OrbitSettings = motion?.loop === false ? baseOrbit : loopedOrbit(baseOrbit, durationSec);
   const viewDirectionAt = (tSec: number): MotionOffset => motion?.fixed ?? getOrbitOffset(tSec, orbit, motion?.phase0 ?? 0);
 
-  // For the stage the window is 1344 px wide, so render the picture at the viewer's highest upscale (1440 px) and let the
-  // stage renderer downsample, instead of stretching the usual 960 px canvas.
+  // For the stage the window is 2160 px wide, so render the picture at the viewer's highest upscale
+  // (1440 px) instead of stretching the usual 960 px canvas.
   const previousUpscale = viewer.getUpscaleMultiplier();
   if (frameMode === 'stage') viewer.setUpscaleMultiplier(3);
   const canvas = viewer.getCanvas();
