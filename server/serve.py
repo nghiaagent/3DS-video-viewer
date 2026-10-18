@@ -40,6 +40,7 @@ DTYPE = os.environ.get("DA3_DTYPE", "bf16")
 
 app = FastAPI()
 _model = {}
+PROGRESS = {"phase": "idle", "done": 0, "total": 0}  # polled by the viewer via /api/progress
 PEAK_GB = 0.0  # max MPS driver allocation seen right after a pass (before empty_cache)
 _lock = threading.Lock()  # one inference at a time; the GPU memory cap assumes it
 
@@ -110,6 +111,7 @@ def infer_windows(left: np.ndarray, right: np.ndarray, stereo: bool = True, fram
     starts = [0] if frames <= per_win else list(range(0, max(1, frames - overlap), per_win - overlap))
     inv = np.zeros((frames, RES_H, RES_W), np.float32)
     prev_end = 0
+    PROGRESS.update(phase="inferring", done=0, total=len(starts))
     for start in starts:
         end = min(frames, start + per_win)
         if prev_end and end <= prev_end:
@@ -135,6 +137,7 @@ def infer_windows(left: np.ndarray, right: np.ndarray, stereo: bool = True, fram
             inv[start:prev_end] = (1 - t)[:, None, None] * inv[start:prev_end] + t[:, None, None] * win[:n_ov]
         inv[start + n_ov:end] = win[n_ov:]
         prev_end = end
+        PROGRESS["done"] += 1
         if end >= frames:
             break
     return inv
@@ -154,9 +157,11 @@ def quantize_and_upscale(inv: np.ndarray) -> np.ndarray:
 
 
 def compute_depth(video: Path) -> bytes:
+    PROGRESS.update(phase="decoding", done=0, total=0)
     left, right = decode_eye(video, 0, RES_W, RES_H), decode_eye(video, 1, RES_W, RES_H)
     inv = infer_windows(left, right)
     depth = quantize_and_upscale(inv)
+    PROGRESS.update(phase="finishing")
     header = json.dumps({"frames": len(depth), "width": OUT_W, "height": OUT_H, "fps": video_fps(video),
                          "res": f"{RES_W}x{RES_H}", "maxViews": MAX_VIEWS}).encode()
     return struct.pack("<I", len(header)) + header + depth.tobytes()
@@ -167,6 +172,11 @@ def compute_depth(video: Path) -> bytes:
 def health():
     return {"model": "DA3-BASE", "device": "mps" if torch.backends.mps.is_available() else "cpu",
             "maxViews": MAX_VIEWS, "res": f"{RES_W}x{RES_H}", "dtype": DTYPE}
+
+
+@app.get("/api/progress")
+def progress():
+    return PROGRESS
 
 
 @app.get("/api/dcim/list")
@@ -197,7 +207,10 @@ def depth_bytes(video: Path) -> bytes:
         return cached.read_bytes()
     with _lock:
         if not cached.exists():
-            blob = compute_depth(video)
+            try:
+                blob = compute_depth(video)
+            finally:
+                PROGRESS.update(phase="idle", done=0, total=0)
             CACHE.mkdir(parents=True, exist_ok=True)
             cached.write_bytes(blob)
     return cached.read_bytes()

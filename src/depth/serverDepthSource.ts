@@ -82,3 +82,28 @@ export async function fetchServerDepthForFile(file: Blob): Promise<ServerDepth> 
     })
   );
 }
+
+export interface ServerProgress {
+  phase: string;
+  done: number;
+  total: number;
+}
+
+/** Polls /api/progress while a depth request is running; returns a function that stops the polling. */
+export function pollServerProgress(onProgress: (p: ServerProgress) => void, intervalMs = 700): () => void {
+  let stopped = false;
+  const tick = async () => {
+    if (stopped) return;
+    try {
+      const res = await fetch('/api/progress');
+      if (res.ok && !stopped) onProgress((await res.json()) as ServerProgress);
+    } catch {
+      // the server may be busy or restarting; keep polling quietly
+    }
+    if (!stopped) setTimeout(tick, intervalMs);
+  };
+  void tick();
+  return () => {
+    stopped = true;
+  };
+}

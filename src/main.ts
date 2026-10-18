@@ -8,6 +8,7 @@ import {
   dcimPathFromUrl,
   fetchServerDepth,
   fetchServerDepthForFile,
+  pollServerProgress,
   serverAvailable,
 } from './depth/serverDepthSource.js';
 
@@ -189,8 +190,16 @@ async function loadVideo(source: LoadVideoSource, displayName?: string) {
     const uploadFile = sourceInput instanceof File ? sourceInput : null;
     if ((dcimPath || uploadFile) && (await serverAvailable())) {
       serverDepthPending = true;
+      let stopProgressPolling = () => {};
       try {
         setImportProgress('Computing depth on local server (DA3, all frames)...', 0.5);
+        stopProgressPolling = pollServerProgress(({ phase, done, total }) => {
+          if (phase === 'inferring' && total > 0) {
+            setImportProgress(`Computing depth on local server (window ${done}/${total})...`, 0.5 + 0.45 * (done / total));
+          } else if (phase === 'decoding' || phase === 'finishing') {
+            setImportProgress(`Computing depth on local server (${phase})...`, 0.5);
+          }
+        });
         const serverDepth = dcimPath ? await fetchServerDepth(dcimPath) : await fetchServerDepthForFile(uploadFile!);
         videoDepthTimeline.loadPrecomputed(
           serverDepth.frames,
@@ -202,6 +211,7 @@ async function loadVideo(source: LoadVideoSource, displayName?: string) {
       } catch (err) {
         console.warn('[ViewerApp] Local depth server failed, falling back to in-browser ONNX:', err);
       } finally {
+        stopProgressPolling();
         serverDepthPending = false;
       }
     }
