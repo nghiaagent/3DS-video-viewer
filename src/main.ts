@@ -44,7 +44,6 @@ const playIcon = document.getElementById('play-icon') as HTMLElement;
 const seekBar = document.getElementById('seek-bar') as HTMLInputElement;
 const timeDisplay = document.getElementById('time-display') as HTMLElement;
 const muteBtn = document.getElementById('mute-btn') as HTMLButtonElement;
-const muteIcon = document.getElementById('mute-icon') as HTMLElement;
 const browseFileBtn = document.getElementById('browse-file-btn') as HTMLButtonElement;
 const fileInput = document.getElementById('file-input') as HTMLInputElement;
 const dropOverlay = document.getElementById('drop-overlay') as HTMLElement;
@@ -331,8 +330,11 @@ seekBar.addEventListener('change', () => {
 
 muteBtn.addEventListener('click', () => {
   sourceVideo.muted = !sourceVideo.muted;
-  muteIcon.textContent = sourceVideo.muted ? '🔇' : '🔊';
 });
+// The icon follows the video's real state (it starts muted, and loading a clip can mute it again)
+const syncMuteIcon = () => muteBtn.classList.toggle('is-muted', sourceVideo.muted);
+sourceVideo.addEventListener('volumechange', syncMuteIcon);
+syncMuteIcon();
 
 // File Browsing & Drag/Drop
 browseFileBtn.addEventListener('click', () => fileInput.click());
@@ -369,8 +371,22 @@ if (backendSelect) {
   });
 }
 
+// Motion only applies to the Spatial 3D view; every other view is shown flat and still
+let motionEnabled = true;
+function updateViewModeUI() {
+  const spatial = parseInt(renderModeSelect.value, 10) === 0;
+  if (spatial && !motionEnabled) orbitAmpCurrent = 0; // orbit grows back out of the centre
+  motionEnabled = spatial;
+  for (const el of document.querySelectorAll<HTMLElement>('.dock-controls .dock-control')) {
+    if (el.contains(renderModeSelect)) continue;
+    el.classList.toggle('is-off', !spatial);
+    el.querySelectorAll('input, select').forEach((c) => ((c as HTMLInputElement).disabled = !spatial));
+  }
+}
+
 renderModeSelect.addEventListener('change', () => {
   viewer.setRenderMode(parseInt(renderModeSelect.value, 10) as RenderMode);
+  updateViewModeUI();
 });
 
 
@@ -538,6 +554,7 @@ let motionOverride: MotionOffset | null = null;
 
 /** Current view direction for the selected motion mode: x, y in [-1, 1]. */
 function resolveMotion(timestampMs: number, dtSeconds: number): MotionOffset {
+  if (!motionEnabled) return { x: 0, y: 0 };
   if (motionOverride) return motionOverride;
   if (motionMode === 'manual') {
     return {

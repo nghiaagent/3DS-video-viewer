@@ -502,10 +502,27 @@ body {
   transform: scale(1.2);
 }
 
-.depth-slider,
-.speed-slider,
-.shift-slider {
-  width: 68px;
+/* every slider in the dock is the same length */
+.dock-controls .vision-slider {
+  width: 96px;
+}
+
+.icon-sound .sound-x {
+  display: none;
+}
+
+.mute-btn.is-muted .icon-sound .sound-waves {
+  display: none;
+}
+
+.mute-btn.is-muted .icon-sound .sound-x {
+  display: inline;
+}
+
+/* controls that only apply to the Spatial 3D view */
+.dock-control.is-off {
+  opacity: 0.35;
+  pointer-events: none;
 }
 
 #seek-bar {
