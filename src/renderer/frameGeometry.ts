@@ -9,7 +9,7 @@ import type { WindowPose } from './motionPath.js';
 export const FRAME = {
   windowWidth: 960,
   windowHeight: 480,
-  cornerRadius: 28,
+  cornerRadius: 12,
   /** CSS `perspective` of the stage; the eye sits this far in front of the stage plane, looking at its centre. */
   perspective: 1200,
   /** Drop shadow under the window: blur radius (Gaussian sigma = blur / 2) and opacity. Its offset comes from the pose. */

@@ -461,12 +461,12 @@ void main() {
 
         vec3 col = stereoColor;
 
-        // Window edge in SCREEN pixels, with the same rounded corners as the page's window (28 px at a 960 px canvas).
+        // Window edge in SCREEN pixels, with the same rounded corners as the page's window (12 px at a 960 px canvas).
         // Measured on gl_FragCoord rather than v_uv: the mesh is only pinned at its very border, so content can be pushed
         // into the band and must still be softened there.
         vec2 halfSize = 0.5 * u_canvasSize;
         vec2 pc = gl_FragCoord.xy - halfSize;
-        float radiusPx = 28.0 * (u_canvasSize.x / 960.0);
+        float radiusPx = 12.0 * (u_canvasSize.x / 960.0);
         float sd = sdRoundRectPx(pc, halfSize, radiusPx);                 // negative inside the window
 
         // Soft rim: in a band just inside the edge the picture blurs and fades toward soft white (the border glows), more
