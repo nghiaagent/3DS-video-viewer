@@ -10,7 +10,9 @@
     "prepare:fixtures": "node scripts/prepare-test-fixtures.mjs",
     "build:wasm": "wasm-pack build crates/stereo-disparity --target web --release --out-dir ../../src/wasm/pkg && rm -f src/wasm/pkg/.gitignore",
     "test:unit": "vitest run",
-    "test:e2e": "playwright test"
+    "test:e2e": "playwright test",
+    "server:setup": "sh server/setup.sh",
+    "serve": "sh server/run.sh"
   },
   "dependencies": {
     "@ffmpeg/core": "^0.12.10",

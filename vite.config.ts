@@ -1,9 +1,11 @@
 import { defineConfig, type Plugin } from 'vite';
 import fs from 'node:fs';
+import os from 'node:os';
 import path from 'node:path';
 import type { IncomingMessage, ServerResponse } from 'node:http';
 
-const DCIM_ROOT = path.resolve('/Users/nghiaagent/Downloads/3DS vids/DCIM');
+// Folder holding the 3DS DCIM recordings; override with the DCIM_ROOT environment variable.
+const DCIM_ROOT = path.resolve(process.env.DCIM_ROOT ?? path.join(os.homedir(), 'Downloads/3DS vids/DCIM'));
 
 interface DcimFileItem {
   name: string;

@@ -1,0 +1,19 @@
+# Local DA3 depth server. Installed by server/setup.sh (do not pip install this directly: see the note there about xformers).
+torch
+torchvision
+numpy<2
+einops
+omegaconf
+safetensors
+huggingface-hub
+opencv-python
+pillow
+matplotlib
+addict
+fastapi
+uvicorn
+# imported by depth_anything_3 when the model loads (export/visualisation helpers):
+moviepy==1.0.3
+plyfile
+trimesh
+evo

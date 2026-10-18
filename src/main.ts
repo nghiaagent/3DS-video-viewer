@@ -4,6 +4,13 @@ import { MotionController } from './renderer/motionController.js';
 import { import3DSVideo, type VideoSource } from './importer/import3DSVideo.js';
 import { exportParallaxVideo, exportOfflineGPUVideo, type ExportFormat, type ExportMode } from './exporter/index.js';
 import { DepthAnythingController, VideoDepthTimeline } from './depth/stereoGuidedDepth.js';
+import {
+  dcimPathFromUrl,
+  fetchServerDepth,
+  fetchServerDepthForFile,
+  pollServerProgress,
+  serverAvailable,
+} from './depth/serverDepthSource.js';
 
 // DOM Elements
 const canvas = document.getElementById('parallax-canvas') as HTMLCanvasElement;
@@ -76,9 +83,8 @@ const depthController = new DepthAnythingController(
     viewer.uploadExternalDepthMap(calibratedDepth, width, height);
   }
 );
-depthController.init().catch((err) => {
-  console.warn('[DepthController] Init warning:', err);
-});
+// No eager depthController.init(): with the local DA3 server supplying depth the in-browser model is never needed,
+// and processVideoFrame() initializes it on demand when a frame has no depth (the ONNX fallback path).
 
 let videoDepthTimeline: VideoDepthTimeline = new VideoDepthTimeline({
   fps: 20,
@@ -96,6 +102,9 @@ viewer.setDepthProvider((timeSec: number) => {
   return null;
 });
 
+// True while the local DA3 server is computing depth for the clip being loaded; the in-browser depth controller must
+// stay idle then (it would otherwise load its own model and run per-frame inference on an empty timeline).
+let serverDepthPending = false;
 let motionMode: 'auto' | 'interactive' | 'manual' = 'auto';
 let isSeeking = false;
 let isExporting = false;
@@ -172,27 +181,64 @@ async function loadVideo(source: LoadVideoSource, displayName?: string) {
     });
     depthController.setTimeline(videoDepthTimeline);
 
+    // Preferred: local DA3 server (all frames, both eyes, joint passes, one global normalization).
+    // DCIM clips are read by the server directly and picked files are uploaded to it; anything else, or a server
+    // failure, uses the in-browser ONNX pipeline below.
+    let usedServerDepth = false;
+    const sourceUrl = 'url' in sourceInput ? sourceInput.url : null;
+    const dcimPath = sourceUrl ? dcimPathFromUrl(sourceUrl) : null;
+    const uploadFile = sourceInput instanceof File ? sourceInput : null;
+    if ((dcimPath || uploadFile) && (await serverAvailable())) {
+      serverDepthPending = true;
+      let stopProgressPolling = () => {};
+      try {
+        setImportProgress('Computing depth on local server (DA3, all frames)...', 0.5);
+        stopProgressPolling = pollServerProgress(({ phase, done, total }) => {
+          if (phase === 'inferring' && total > 0) {
+            setImportProgress(`Computing depth on local server (window ${done}/${total})...`, 0.5 + 0.45 * (done / total));
+          } else if (phase === 'decoding' || phase === 'finishing') {
+            setImportProgress(`Computing depth on local server (${phase})...`, 0.5);
+          }
+        });
+        const serverDepth = dcimPath ? await fetchServerDepth(dcimPath) : await fetchServerDepthForFile(uploadFile!);
+        videoDepthTimeline.loadPrecomputed(
+          serverDepth.frames,
+          sourceVideo.duration,
+          serverDepth.width,
+          serverDepth.height
+        );
+        usedServerDepth = true;
+      } catch (err) {
+        console.warn('[ViewerApp] Local depth server failed, falling back to in-browser ONNX:', err);
+      } finally {
+        stopProgressPolling();
+        serverDepthPending = false;
+      }
+    }
+
     const isE2E =
       typeof navigator !== 'undefined' &&
       (Boolean((navigator as any).webdriver) || /HeadlessChrome/.test(navigator.userAgent));
     const initialKeyframes = isE2E ? 2 : 12;
     const timelineTimeoutMs = isE2E ? 12_000 : 30_000;
 
-    await Promise.race([
-      videoDepthTimeline.buildInitialTimeline(
-        sourceVideo,
-        viewer.getBaseDisparity(),
-        (stage, ratio) => {
-          const displayStage = stage.includes('Analyzing') ? 'Analyzing 3D stereo depth (V3)...' : stage;
-          setImportProgress(displayStage, ratio);
-        },
-        {
-          initialKeyframes,
-          runFullStreamInBackground: true,
-        }
-      ),
-      new Promise<void>((resolve) => setTimeout(resolve, timelineTimeoutMs)),
-    ]);
+    if (!usedServerDepth) {
+      await Promise.race([
+        videoDepthTimeline.buildInitialTimeline(
+          sourceVideo,
+          viewer.getBaseDisparity(),
+          (stage, ratio) => {
+            const displayStage = stage.includes('Analyzing') ? 'Analyzing 3D stereo depth (V3)...' : stage;
+            setImportProgress(displayStage, ratio);
+          },
+          {
+            initialKeyframes,
+            runFullStreamInBackground: true,
+          }
+        ),
+        new Promise<void>((resolve) => setTimeout(resolve, timelineTimeoutMs)),
+      ]);
+    }
 
     // Initial pass complete; hide progress banner and start playback
     setImportProgress('Ready', 1.0);
@@ -488,7 +534,7 @@ function renderLoop(timestampMs: number) {
     const verticalTilt = motionController.getVerticalTilt();
     viewer.renderVideoFrame(sourceVideo, viewShift, verticalTilt);
 
-    if (!depthController.isBusy()) {
+    if (!serverDepthPending && !depthController.isBusy()) {
       depthController.processVideoFrame(sourceVideo, viewer.getBaseDisparity(), 16).catch(() => {});
     }
   }

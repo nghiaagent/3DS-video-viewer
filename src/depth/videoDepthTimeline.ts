@@ -236,6 +236,22 @@ export class VideoDepthTimeline {
     }
   }
 
+  /**
+   * Installs a complete, externally computed depth sequence (one entry per video frame, frame index = round(t * fps)).
+   * Used by the local DA3 server path, which already provides every frame with one global normalization.
+   */
+  public loadPrecomputed(frames: Uint8Array[], durationSec: number, width: number, height: number): void {
+    this.timelineV3.clear();
+    frames.forEach((frame, i) => this.timelineV3.set(i, frame));
+    this.totalFrames = frames.length;
+    this.duration = durationSec;
+    this.scratchWidth = width;
+    this.scratchHeight = height;
+    this.scratchBuffer = new Uint8Array(width * height);
+    this.isComplete = true;
+    this.allFramesResolve?.();
+  }
+
   public getFrameCount(): { v3: number; total: number } {
     return {
       v3: this.timelineV3.size,

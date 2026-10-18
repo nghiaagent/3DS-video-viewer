@@ -9,3 +9,7 @@ tests/fixtures/
 *.log
 public/models/*.onnx
 public/onnx-wasm/
+server/.venv/
+server/cache/
+__pycache__/
+*.pyc
