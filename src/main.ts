@@ -89,7 +89,7 @@ const viewer = new WebGLParallaxViewer(canvas, {
   upscale: 2,
   backend: 'gpu',
   renderMode: 0,
-  windowCrop: 0.06,
+  windowCrop: 0,
   maxDisp: 24,
 });
 

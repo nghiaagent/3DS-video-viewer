@@ -198,7 +198,7 @@ export class WebGLParallaxViewer {
   private backend: DisparityBackend = 'gpu';
   private upscale: UpscaleMultiplier = 2;
   private renderMode: RenderMode = 0;
-  private windowCrop: number = 0.0833; // 40px crop per side on 480x240 for 400x240 (5:3) 3DS screen
+  private windowCrop: number = 0; // optional zoom that trims this fraction from every side; 0 shows the whole frame
   private maxDisp: number = 20;
   private flipY: boolean = true; // Default to true so HTMLVideoElement is upright on screen
 
