@@ -1,0 +1,21 @@
+# Local DA3 depth server. Install via server/setup.sh (xformers is CUDA-only and is intentionally skipped).
+torch
+torchvision
+numpy<2
+einops
+omegaconf
+safetensors
+huggingface-hub
+opencv-python
+pillow
+imageio
+trimesh
+plyfile
+typer
+e3nn
+evo
+moviepy==1.0.3
+fastapi
+uvicorn
+addict
+pycolmap
