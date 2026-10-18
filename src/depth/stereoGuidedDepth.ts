@@ -443,7 +443,7 @@ export function calibrateDepthWithStereoSBS(
   let sbsHeight = sbsHeightArg;
   let gradThreshold = 12.0;
   let step = 2;
-  let expandRadius = 1;
+  let expandRadius = 0;
   let alphaConfidence = 0.0;
   let contrastStretch = true;
   let rightDaDepth: Float32Array | undefined;
@@ -580,10 +580,6 @@ export function calibrateDepthWithStereoSBS(
   const dispSpan = dispMax - dispMin;
   const invDispSpan = dispSpan > 0 ? 1.0 / dispSpan : 1.0;
 
-  const anchorNormDisp = new Float32Array(eyeWidth * eyeHeight);
-  anchorNormDisp.fill(-1);
-  const anchorConf = new Float32Array(eyeWidth * eyeHeight);
-
   const anchorX: number[] = [];
   const anchorY: number[] = [];
   const anchorDa: number[] = [];
@@ -654,9 +650,6 @@ export function calibrateDepthWithStereoSBS(
         const conf = Math.max(0.01, Math.min(1.0, gradWeight * sadWeight * (0.5 + 0.5 * Math.min(1.0, pkrn))));
 
         const idx = rowOffset + x;
-        anchorNormDisp[idx] = dNorm;
-        anchorConf[idx] = conf;
-
         anchorX.push(x);
         anchorY.push(y);
         anchorDa.push(leftDaDepth[idx]);
@@ -787,7 +780,7 @@ export function calibrateDepthWithStereoSBS(
   }
 
   // --------------------------------------------------------------------------
-  // STEP C: Calibrated Depth Mapping, Multi-View Consensus & Local Stereo Residual Fusion
+  // STEP C: Calibrated Depth Mapping & Multi-View Consensus
   // --------------------------------------------------------------------------
   const calibratedFloat = new Float32Array(eyeWidth * eyeHeight);
   for (let y = 0; y < eyeHeight; y++) {
@@ -800,32 +793,29 @@ export function calibrateDepthWithStereoSBS(
         // Physical stereo disparity from calibrated left depth
         const d0CalNorm = Math.max(0, Math.min(1, scaleA * d0 + shiftB));
         const disp = dispMin + d0CalNorm * dispSpan;
-        // When rightDaDepth comes from pre-rectified Right Eye, coordinate is already shifted by baseDisp
         const xr = rightIsRectified
-          ? Math.max(0, Math.min(eyeWidth - 1, Math.round(x - (disp - baseDisp))))
-          : Math.max(0, Math.min(eyeWidth - 1, Math.round(x - disp)));
-        const d1 = rightDaDepth[rowOffset + xr];
+          ? Math.round(x - (disp - baseDisp))
+          : Math.round(x - disp);
 
-        const c0 = conf0 ? Math.max(1e-4, conf0[idx]) : 1.0;
-        const c1 = conf1 ? Math.max(1e-4, conf1[rowOffset + xr]) : 1.0;
+        if (xr >= 8 && xr < eyeWidth - 8) {
+          const d1 = rightDaDepth[rowOffset + xr];
 
-        // Where both views agree in 3D space, weight by confidence.
-        // In half-occluded areas, exp(-diff * 6.0) falls to 0, smoothly preserving View 0.
-        const diff = Math.abs(d0 - d1);
-        const w0 = c0;
-        const w1 = c1 * Math.exp(-diff * 6.0);
-        const dConsensus = (w0 * d0 + w1 * d1) / (w0 + w1);
+          const c0 = conf0 ? Math.max(1e-4, conf0[idx]) : 1.0;
+          const c1 = conf1 ? Math.max(1e-4, conf1[rowOffset + xr]) : 1.0;
 
-        calibratedFloat[idx] = scaleA * dConsensus + shiftB;
+          // Where both views agree in 3D space, weight by confidence.
+          // In half-occluded areas, exp(-diff * 6.0) falls to 0, smoothly preserving View 0.
+          const diff = Math.abs(d0 - d1);
+          const w0 = c0;
+          const w1 = c1 * Math.exp(-diff * 6.0);
+          const dConsensus = (w0 * d0 + w1 * d1) / (w0 + w1);
+
+          calibratedFloat[idx] = scaleA * dConsensus + shiftB;
+        } else {
+          calibratedFloat[idx] = scaleA * d0 + shiftB;
+        }
       } else {
         calibratedFloat[idx] = scaleA * d0 + shiftB;
-      }
-
-      // Blend local stereo disparity residual if high-confidence anchor
-      if (anchorConf[idx] > 0.25 && anchorNormDisp[idx] >= 0) {
-        const residual = anchorNormDisp[idx] - calibratedFloat[idx];
-        const blendWeight = Math.min(0.5, anchorConf[idx] * 0.6);
-        calibratedFloat[idx] += blendWeight * residual;
       }
     }
   }
@@ -1180,7 +1170,7 @@ export class DepthAnythingController {
       }
 
       // Step: Lock raw DepthAnything depth to real SBS stereo pair
-      const expandRadius = this.options.dilateRadius ?? this.options.expandRadius ?? 1;
+      const expandRadius = this.options.dilateRadius ?? this.options.expandRadius ?? 0;
       const calResult = calibrateDepthWithStereoSBS(
         result.rawDepth,
         sbsRgba,
@@ -1196,9 +1186,9 @@ export class DepthAnythingController {
           rightDaDepth: result.rawRightDepth,
           conf0: result.conf0 ?? result.confidence,
           conf1: result.conf1,
-          rightIsRectified: baseDisp !== 0,
+          rightIsRectified: false,
           asymmetricSearch: this.options.asymmetricSearch,
-          useGuidedFilter: this.options.useGuidedFilter,
+          useGuidedFilter: this.options.useGuidedFilter ?? false,
           guidedFilterRadius: this.options.guidedFilterRadius,
           guidedFilterEps: this.options.guidedFilterEps,
         }
@@ -1351,7 +1341,7 @@ export class DepthAnythingController {
     this.pendingMaxDisp = effectiveMaxDisp;
 
     const leftEyeRgba = extractLeftEyeRgba(sbsRgba, sbsWidth, sbsHeight);
-    const rightEyeRgba = extractRectifiedRightEyeRgba(sbsRgba, sbsWidth, sbsHeight, effectiveBaseDisp);
+    const rightEyeRgba = extractRightEyeRgba(sbsRgba, sbsWidth, sbsHeight);
     const inputSize = this.options.inputSize || 392;
 
     if (this.options.customInfer) {

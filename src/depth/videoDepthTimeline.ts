@@ -1,6 +1,6 @@
 import {
   extractLeftEyeRgba,
-  extractRectifiedRightEyeRgba,
+  extractRightEyeRgba,
   calibrateDepthWithStereoSBS,
 } from './stereoGuidedDepth.js';
 import type {
@@ -193,7 +193,7 @@ export class VideoDepthTimeline {
     this.inputSize = options?.inputSize ?? 392; // 28 * 14 = 392, exact 2:1 rectangular resolution
     this.baseDisp = options?.baseDisp ?? 0;
     this.maxDisp = options?.maxDisp ?? 16;
-    this.expandRadius = options?.expandRadius ?? 1;
+    this.expandRadius = options?.expandRadius ?? 0;
 
     let resolveFn: () => void = () => {};
     this.allFramesPromise = new Promise<void>((resolve) => {
@@ -440,7 +440,7 @@ export class VideoDepthTimeline {
     const eyeW = Math.floor(sbsWidth / 2);
     const eyeH = sbsHeight;
     const leftRgba = extractLeftEyeRgba(sbsRgba, sbsWidth, sbsHeight);
-    const rightRgba = extractRectifiedRightEyeRgba(sbsRgba, sbsWidth, sbsHeight, this.baseDisp);
+    const rightRgba = extractRightEyeRgba(sbsRgba, sbsWidth, sbsHeight);
 
     // Save compact Left Eye luma for edge-guided temporal interpolation
     const leftLuma = new Uint8Array(eyeW * eyeH);
@@ -500,7 +500,7 @@ export class VideoDepthTimeline {
         rightDaDepth: rawRightDepth,
         conf0,
         conf1,
-        rightIsRectified: this.baseDisp !== 0,
+        rightIsRectified: false,
       }
     );
 
@@ -562,19 +562,26 @@ export class VideoDepthTimeline {
     for (let i = 0; i < keyframeIndices.length; i += 2) {
       if (this.isDestroyed) return;
       const batch = keyframeIndices.slice(i, i + 2);
-      const tasks = batch.map(async (frameIdx, idxInBatch) => {
+      const extracted: Array<{ frameIdx: number; sbsRgba: Uint8Array }> = [];
+      for (const frameIdx of batch) {
+        if (this.isDestroyed) return;
         const timeSec = Math.max(0, Math.min(this.duration, frameIdx / this.fps));
         const sbsRgba = await this.extractFrameRgba(video, timeSec, frameIdx);
         if (sbsRgba) {
-          const depth = await this.computeConsensusDepthForFrame(
-            sbsRgba,
-            sbsW,
-            sbsH,
-            frameIdx,
-            idxInBatch
-          );
-          this.timelineV3.set(frameIdx, depth);
+          extracted.push({ frameIdx, sbsRgba });
         }
+      }
+      if (this.isDestroyed) return;
+
+      const tasks = extracted.map(async ({ frameIdx, sbsRgba }, idxInBatch) => {
+        const depth = await this.computeConsensusDepthForFrame(
+          sbsRgba,
+          sbsW,
+          sbsH,
+          frameIdx,
+          idxInBatch
+        );
+        this.timelineV3.set(frameIdx, depth);
       });
       await Promise.all(tasks);
 
@@ -590,7 +597,7 @@ export class VideoDepthTimeline {
 
     // Phase 2: Start continuous full-stream background fill
     if (runFullStream) {
-      this.startBackgroundFill(video, sbsW, sbsH, onProgress);
+      this.startBackgroundFill(video, sbsW, sbsH);
     } else {
       await this.fillAllRemainingFrames(video, sbsW, sbsH, onProgress);
     }
@@ -645,19 +652,26 @@ export class VideoDepthTimeline {
     for (let i = 0; i < missingFrames.length; i += 2) {
       if (this.isDestroyed) return;
       const batch = missingFrames.slice(i, i + 2);
-      const tasks = batch.map(async (frameIdx, idxInBatch) => {
+      const extracted: Array<{ frameIdx: number; sbsRgba: Uint8Array }> = [];
+      for (const frameIdx of batch) {
+        if (this.isDestroyed) return;
         const timeSec = Math.max(0, Math.min(this.duration, frameIdx / this.fps));
         const sbsRgba = await this.extractFrameRgba(video, timeSec, frameIdx);
         if (sbsRgba) {
-          const depth = await this.computeConsensusDepthForFrame(
-            sbsRgba,
-            sbsW,
-            sbsH,
-            frameIdx,
-            idxInBatch
-          );
-          this.timelineV3.set(frameIdx, depth);
+          extracted.push({ frameIdx, sbsRgba });
         }
+      }
+      if (this.isDestroyed) return;
+
+      const tasks = extracted.map(async ({ frameIdx, sbsRgba }, idxInBatch) => {
+        const depth = await this.computeConsensusDepthForFrame(
+          sbsRgba,
+          sbsW,
+          sbsH,
+          frameIdx,
+          idxInBatch
+        );
+        this.timelineV3.set(frameIdx, depth);
       });
       await Promise.all(tasks);
 
