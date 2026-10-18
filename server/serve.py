@@ -14,6 +14,7 @@ import os
 import struct
 import subprocess
 import threading
+import time
 from pathlib import Path
 
 import numpy as np
@@ -22,6 +23,7 @@ import torch.nn.functional as F
 import uvicorn
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.responses import FileResponse, JSONResponse, Response
+from starlette.concurrency import run_in_threadpool
 from starlette.staticfiles import StaticFiles
 
 from bench_maxviews import FFMPEG, build_mono_views, build_views, decode_eye, depth_of, run_model
@@ -187,19 +189,53 @@ def dcim_file(path: str):
     return FileResponse(p, media_type=mime)  # Starlette serves Range requests
 
 
-@app.get("/api/depth")
-def depth(path: str):
-    video = safe_dcim(path)
+def depth_bytes(video: Path) -> bytes:
+    """Depth sequence for a video file (cached on disk by path + mtime + settings)."""
     key = hashlib.sha1(f"{video}|{video.stat().st_mtime_ns}|{RES_W}x{RES_H}|{MAX_VIEWS}|{DTYPE}".encode()).hexdigest()
     cached = CACHE / f"{key}.bin"
     if cached.exists():
-        return Response(cached.read_bytes(), media_type="application/octet-stream")
+        return cached.read_bytes()
     with _lock:
         if not cached.exists():
             blob = compute_depth(video)
             CACHE.mkdir(parents=True, exist_ok=True)
             cached.write_bytes(blob)
-    return Response(cached.read_bytes(), media_type="application/octet-stream")
+    return cached.read_bytes()
+
+
+@app.get("/api/depth")
+def depth(path: str):
+    return Response(depth_bytes(safe_dcim(path)), media_type="application/octet-stream")
+
+
+@app.post("/api/depth/upload")
+async def depth_upload(request: Request):
+    """Depth for a file the user picked in the browser: the body is streamed to disk, then processed like a DCIM clip.
+
+    Uploads are stored content-addressed in server/cache/uploads so the same file is only processed once.
+    """
+    uploads = CACHE / "uploads"
+    uploads.mkdir(parents=True, exist_ok=True)
+    tmp = uploads / f"upload-{os.getpid()}-{time.time_ns()}.part"
+    sha, size = hashlib.sha1(), 0
+    with tmp.open("wb") as f:
+        async for chunk in request.stream():
+            sha.update(chunk)
+            size += len(chunk)
+            f.write(chunk)
+    if size == 0:
+        tmp.unlink(missing_ok=True)
+        raise HTTPException(400, "empty upload")
+    final = uploads / f"{sha.hexdigest()}.avi"
+    if final.exists():
+        tmp.unlink(missing_ok=True)
+    else:
+        tmp.replace(final)
+    try:
+        blob = await run_in_threadpool(depth_bytes, final)
+    except Exception as e:  # not a 3DS dual-stream AVI, decode failure, ...
+        raise HTTPException(422, f"could not compute depth: {type(e).__name__}: {str(e)[:200]}")
+    return Response(blob, media_type="application/octet-stream")
 
 
 dist = ROOT / "dist"

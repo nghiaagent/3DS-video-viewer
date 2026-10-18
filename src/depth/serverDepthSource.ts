@@ -3,8 +3,8 @@
  *
  * The server runs every frame of the clip, both eyes, through DepthAnything3 in windowed joint passes with one
  * clip-global normalization, so depth is consistent over time. It only knows files under its DCIM root, so this
- * path is used when the viewer was opened with `?dcim=` (an /api/dcim/file URL); anything else falls back to the
- * in-browser ONNX pipeline.
+ * path is used for DCIM URLs (`?dcim=`) and for files picked in the browser, which are uploaded; anything else
+ * (or any server failure) falls back to the in-browser ONNX pipeline.
  */
 
 export interface ServerDepth {
@@ -43,9 +43,7 @@ export async function serverAvailable(timeoutMs = 800): Promise<boolean> {
   }
 }
 
-/** Fetches all depth frames: [u32 LE header length][JSON header][frames * width * height uint8]. */
-export async function fetchServerDepth(dcimPath: string): Promise<ServerDepth> {
-  const res = await fetch(`/api/depth?path=${encodeURIComponent(dcimPath)}`);
+async function parseDepthResponse(res: Response): Promise<ServerDepth> {
   if (!res.ok) {
     throw new Error(`Depth server returned ${res.status}`);
   }
@@ -67,4 +65,20 @@ export async function fetchServerDepth(dcimPath: string): Promise<ServerDepth> {
     frames.push(new Uint8Array(buf, base + i * frameBytes, frameBytes));
   }
   return { frames, fps: header.fps, width: header.width, height: header.height };
+}
+
+/** Fetches all depth frames for a DCIM clip: [u32 LE header length][JSON header][frames * width * height uint8]. */
+export async function fetchServerDepth(dcimPath: string): Promise<ServerDepth> {
+  return parseDepthResponse(await fetch(`/api/depth?path=${encodeURIComponent(dcimPath)}`));
+}
+
+/** Uploads a user-picked .AVI to the server (streamed to disk there) and returns its depth sequence. */
+export async function fetchServerDepthForFile(file: Blob): Promise<ServerDepth> {
+  return parseDepthResponse(
+    await fetch('/api/depth/upload', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/octet-stream' },
+      body: file,
+    })
+  );
 }

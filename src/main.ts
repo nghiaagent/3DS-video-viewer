@@ -4,7 +4,12 @@ import { MotionController } from './renderer/motionController.js';
 import { import3DSVideo, type VideoSource } from './importer/import3DSVideo.js';
 import { exportParallaxVideo, exportOfflineGPUVideo, type ExportFormat, type ExportMode } from './exporter/index.js';
 import { DepthAnythingController, VideoDepthTimeline } from './depth/stereoGuidedDepth.js';
-import { dcimPathFromUrl, fetchServerDepth, serverAvailable } from './depth/serverDepthSource.js';
+import {
+  dcimPathFromUrl,
+  fetchServerDepth,
+  fetchServerDepthForFile,
+  serverAvailable,
+} from './depth/serverDepthSource.js';
 
 // DOM Elements
 const canvas = document.getElementById('parallax-canvas') as HTMLCanvasElement;
@@ -96,6 +101,9 @@ viewer.setDepthProvider((timeSec: number) => {
   return null;
 });
 
+// True while the local DA3 server is computing depth for the clip being loaded; the in-browser depth controller must
+// stay idle then (it would otherwise load its own model and run per-frame inference on an empty timeline).
+let serverDepthPending = false;
 let motionMode: 'auto' | 'interactive' | 'manual' = 'auto';
 let isSeeking = false;
 let isExporting = false;
@@ -173,14 +181,17 @@ async function loadVideo(source: LoadVideoSource, displayName?: string) {
     depthController.setTimeline(videoDepthTimeline);
 
     // Preferred: local DA3 server (all frames, both eyes, joint passes, one global normalization).
-    // Only for DCIM sources the server can see; everything else uses the in-browser ONNX pipeline below.
+    // DCIM clips are read by the server directly and picked files are uploaded to it; anything else, or a server
+    // failure, uses the in-browser ONNX pipeline below.
     let usedServerDepth = false;
     const sourceUrl = 'url' in sourceInput ? sourceInput.url : null;
     const dcimPath = sourceUrl ? dcimPathFromUrl(sourceUrl) : null;
-    if (dcimPath && (await serverAvailable())) {
+    const uploadFile = sourceInput instanceof File ? sourceInput : null;
+    if ((dcimPath || uploadFile) && (await serverAvailable())) {
+      serverDepthPending = true;
       try {
         setImportProgress('Computing depth on local server (DA3, all frames)...', 0.5);
-        const serverDepth = await fetchServerDepth(dcimPath);
+        const serverDepth = dcimPath ? await fetchServerDepth(dcimPath) : await fetchServerDepthForFile(uploadFile!);
         videoDepthTimeline.loadPrecomputed(
           serverDepth.frames,
           sourceVideo.duration,
@@ -190,6 +201,8 @@ async function loadVideo(source: LoadVideoSource, displayName?: string) {
         usedServerDepth = true;
       } catch (err) {
         console.warn('[ViewerApp] Local depth server failed, falling back to in-browser ONNX:', err);
+      } finally {
+        serverDepthPending = false;
       }
     }
 
@@ -511,7 +524,7 @@ function renderLoop(timestampMs: number) {
     const verticalTilt = motionController.getVerticalTilt();
     viewer.renderVideoFrame(sourceVideo, viewShift, verticalTilt);
 
-    if (!depthController.isBusy()) {
+    if (!serverDepthPending && !depthController.isBusy()) {
       depthController.processVideoFrame(sourceVideo, viewer.getBaseDisparity(), 16).catch(() => {});
     }
   }
