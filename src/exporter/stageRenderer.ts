@@ -6,7 +6,7 @@
  * It owns a separate WebGL2 context: the viewer's canvas is uploaded as a texture each frame, and every output pixel is
  * mapped back onto the tilted window plane by a ray-plane intersection (the exact inverse of the CSS 3D transform).
  */
-import { DEFAULT_GLOW, type GlowState } from '../renderer/contentGlow.js';
+import { DEFAULT_GLOW, edgeGlowRgb, type GlowState } from '../renderer/contentGlow.js';
 import { FRAME, windowBasis } from '../renderer/frameGeometry.js';
 import type { WindowPose } from '../renderer/motionPath.js';
 
@@ -289,7 +289,8 @@ export class StageRenderer {
     gl.uniform1f(L.shadowAlpha, FRAME.shadow.alpha);
     gl.uniform1f(L.shadowSigma, (FRAME.shadow.blur / 2) * s);
     const E = FRAME.edge;
-    gl.uniform3f(L.edgeRgb, E.rgb[0] / 255, E.rgb[1] / 255, E.rgb[2] / 255);
+    const edgeRgb = edgeGlowRgb(glow);
+    gl.uniform3f(L.edgeRgb, edgeRgb[0] / 255, edgeRgb[1] / 255, edgeRgb[2] / 255);
     gl.uniform1f(L.borderAlpha, E.borderAlpha);
     gl.uniform1f(L.innerAlpha, E.innerAlpha);
     gl.uniform1f(L.innerSigma, (E.innerBlur / 2) * s);

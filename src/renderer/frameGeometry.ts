@@ -17,10 +17,10 @@ export const FRAME = {
   /** Faint cyan halo around the window. */
   halo: { blur: 90, rgb: [56, 189, 248] as const, alpha: 0.08 },
   /**
-   * Warm-white glowing border: a 1 px line, an inner glow (CSS inset shadow) and an outer glow, so the window reads clearly
-   * and its blurred edge fades toward warm white rather than black. Blurs are CSS blur radii (Gaussian sigma = blur / 2).
+   * Soft white glowing border: a 1 px line, an inner glow (CSS inset shadow) and an outer glow, so the window reads clearly
+   * and its blurred edge fades toward white rather than black. Blurs are CSS blur radii (Gaussian sigma = blur / 2).
    */
-  edge: { rgb: [255, 238, 210] as const, borderAlpha: 0.55, innerAlpha: 0.45, innerBlur: 20, outerAlpha: 0.3, outerBlur: 36 },
+  edge: { borderAlpha: 0.4, innerAlpha: 0.26, innerBlur: 20, outerAlpha: 0.16, outerBlur: 36 },
   /** Soft elliptical ambient glow behind the window. */
   glow: { width: 1500, height: 900, blur: 80 },
   background: [6, 7, 10] as const,

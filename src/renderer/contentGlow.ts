@@ -62,6 +62,13 @@ export function smoothGlow(prev: GlowState, target: GlowState, dtSec: number, ta
   };
 }
 
+/** The window's edge glow: the glow's colour lightened toward soft white, so a pink picture gets a pale pink edge. */
+export function edgeGlowRgb(g: GlowState): Rgb {
+  const white: Rgb = [238, 238, 241];
+  const c = mixRgb(g.c1, white, 0.55);
+  return [Math.round(c[0]), Math.round(c[1]), Math.round(c[2])];
+}
+
 /** Rounds to what is worth writing to CSS (whole colour steps, alpha in 0.005 steps) so the blurred layer repaints rarely. */
 export function quantizeGlow(g: GlowState): GlowState {
   const q = (c: Rgb): Rgb => [Math.round(c[0]), Math.round(c[1]), Math.round(c[2])];

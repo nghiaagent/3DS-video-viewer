@@ -469,7 +469,7 @@ void main() {
         float radiusPx = 28.0 * (u_canvasSize.x / 960.0);
         float sd = sdRoundRectPx(pc, halfSize, radiusPx);                 // negative inside the window
 
-        // Soft rim: in a band just inside the edge the picture blurs and fades toward warm white (the border glows), more
+        // Soft rim: in a band just inside the edge the picture blurs and fades toward soft white (the border glows), more
         // while the view is turned. Not depth-based.
         float rim = 1.0 - smoothstep(0.0, 0.035 * u_canvasSize.x, -sd);
         float wRim = clamp(rim * u_edgeSoftness * (0.45 + 0.55 * u_edgeMotion), 0.0, 1.0);
@@ -484,8 +484,10 @@ void main() {
                 acc += textureLod(u_sbsTexture, vec2(uv.x * 0.5, uv.y), 0.0).rgb;
             }
             col = mix(col, acc / 17.0, wRim);
-            // warm white wash, strongest at the very edge; a fixed part so the glow also shows at rest
-            col = mix(col, vec3(1.0, 0.93, 0.82), 0.6 * rim * u_edgeSoftness * (0.55 + 0.45 * u_edgeMotion));
+            // pale wash of the edge colour, strongest at the very edge; a fixed part so the glow also shows at rest
+            // the wash follows the picture's own colour at the edge (the blurred taps), lightened
+            vec3 edgeWash = mix(acc / 17.0, vec3(0.933, 0.933, 0.945), 0.5);
+            col = mix(col, edgeWash, 0.4 * rim * u_edgeSoftness * (0.55 + 0.45 * u_edgeMotion));
         }
 
         // Fine film grain: 2 px cells, strongest in the mid-tones so blacks and the dark rim stay clean.

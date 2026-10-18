@@ -12,7 +12,7 @@ import {
 import { StageRenderer } from './exporter/stageRenderer.js';
 import { grainSeedForTime } from './renderer/grain.js';
 import { FRAME } from './renderer/frameGeometry.js';
-import { DEFAULT_GLOW, glowColors, glowEquals, quantizeGlow, smoothGlow, type GlowState } from './renderer/contentGlow.js';
+import { DEFAULT_GLOW, edgeGlowRgb, glowColors, glowEquals, quantizeGlow, smoothGlow, type GlowState } from './renderer/contentGlow.js';
 import { DepthAnythingController, VideoDepthTimeline } from './depth/stereoGuidedDepth.js';
 import {
   DEFAULT_ORBIT,
@@ -594,6 +594,7 @@ function updateGlow(dtSeconds: number) {
   const root = document.documentElement.style;
   root.setProperty('--glow-c1', q.c1.join(', '));
   root.setProperty('--glow-c2', q.c2.join(', '));
+  root.setProperty('--edge-rgb', edgeGlowRgb(q).join(', '));
   root.setProperty('--glow-a1', q.a1.toFixed(3));
   root.setProperty('--glow-a2', q.a2.toFixed(3));
 }
@@ -623,7 +624,7 @@ function renderLoop(timestampMs: number) {
     spatialWindow.style.boxShadow =
       `${pose.shadowX.toFixed(1)}px ${pose.shadowY.toFixed(1)}px 80px rgba(0, 0, 0, 0.85), ` +
       `0 0 90px rgba(${glowShown.c1.join(', ')}, 0.08), ` +
-      `0 0 ${FRAME.edge.outerBlur}px rgba(${FRAME.edge.rgb.join(', ')}, ${FRAME.edge.outerAlpha})`;
+      `0 0 ${FRAME.edge.outerBlur}px rgba(${edgeGlowRgb(glowShown).join(', ')}, ${FRAME.edge.outerAlpha})`;
 
     if (ambientGlow) {
       ambientGlow.style.transform = `translate3d(${pose.glowX.toFixed(1)}px, ${pose.glowY.toFixed(1)}px, 0px)`;

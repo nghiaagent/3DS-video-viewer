@@ -1,5 +1,5 @@
 import { describe, it, expect } from 'vitest';
-import { DEFAULT_GLOW, glowColors, quantizeGlow, smoothGlow } from '../../src/renderer/contentGlow.js';
+import { DEFAULT_GLOW, edgeGlowRgb, glowColors, quantizeGlow, smoothGlow } from '../../src/renderer/contentGlow.js';
 
 describe('glowColors', () => {
   it('falls back to the default for missing, NaN and black input', () => {
@@ -50,5 +50,16 @@ describe('smoothGlow', () => {
 describe('quantizeGlow', () => {
   it('leaves the default exactly unchanged', () => {
     expect(quantizeGlow(DEFAULT_GLOW)).toEqual(DEFAULT_GLOW);
+  });
+});
+
+describe('edgeGlowRgb', () => {
+  it('lightens the glow colour toward white but keeps its hue', () => {
+    const e = edgeGlowRgb(glowColors([230, 40, 60]));
+    expect(e[0]).toBeGreaterThan(e[1]);
+    expect(Math.min(...e)).toBeGreaterThan(100); // pale, not saturated
+  });
+  it('matches the CSS default for the default glow', () => {
+    expect(edgeGlowRgb(DEFAULT_GLOW)).toEqual([156, 216, 244]);
   });
 });

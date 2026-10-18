@@ -31,12 +31,12 @@ test.describe('window finish', () => {
     await page.waitForFunction(() => !!(window as any).__viewerApp?.viewer);
   });
 
-  test('the rim fades the picture toward warm white near the edge and leaves the interior alone', async ({ page }) => {
+  test('the rim fades the picture toward soft white near the edge and leaves the interior alone', async ({ page }) => {
     const r = await renderFlat(page, 200, { soft: 0.8, shift: 1 });
     const mid = at(r, r.width >> 1, r.height >> 1);
     const nearEdge = at(r, r.width >> 1, 3);
     expect(mid).toBeGreaterThan(190);
-    expect(nearEdge).toBeGreaterThan(mid + 8); // red channel lifts toward the warm white (255, 237, 209)
+    expect(nearEdge).toBeGreaterThan(mid + 3); // lifts toward the soft white (238, 238, 241)
     const off = await renderFlat(page, 200, { soft: 0, shift: 1 });
     expect(Math.abs(at(off, off.width >> 1, 3) - 200)).toBeLessThan(3);
   });
