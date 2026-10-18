@@ -1,4 +1,4 @@
-# Local DA3 depth server. Install via server/setup.sh (xformers is CUDA-only and is intentionally skipped).
+# Local DA3 depth server. Installed by server/setup.sh (do not pip install this directly: see the note there about xformers).
 torch
 torchvision
 numpy<2
@@ -8,14 +8,12 @@ safetensors
 huggingface-hub
 opencv-python
 pillow
-imageio
-trimesh
-plyfile
-typer
-e3nn
-evo
-moviepy==1.0.3
+matplotlib
+addict
 fastapi
 uvicorn
-addict
-pycolmap
+# imported by depth_anything_3 when the model loads (export/visualisation helpers):
+moviepy==1.0.3
+plyfile
+trimesh
+evo
